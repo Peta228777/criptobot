@@ -1445,4 +1445,18 @@ async def on_startup(dp: Dispatcher):
 
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    import asyncio
+from aiogram import Bot, Dispatcher
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+
+    # подключи свои роутеры
+    dp.include_router(router)
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
