@@ -992,7 +992,18 @@ async def admin_all_subs(message: types.Message):
         return
 
     cursor.execute("SELECT * FROM subscriptions")
-    rows = cursor.fetchall()
+    rows = cursor.fetchall()cursor.execute("""
+    SELECT
+        user_id,
+        paid,
+        start_date,
+        end_date,
+        last_tx_amount,
+        last_tx_time
+    FROM subscriptions
+""")
+rows = cursor.fetchall()
+
     if not rows:
         return await message.answer("Пока нет подписчиков.")
 
