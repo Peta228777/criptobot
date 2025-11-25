@@ -563,9 +563,12 @@ async def trading_education(message: types.Message):
 async def trading_lesson_callback(call: types.CallbackQuery):
     idx = int(call.data.split(":")[1])
     title, body = TRADING_LESSONS[idx]
+
+    # без Markdown — чтобы точно не ломалось из-за разметки
     await call.message.edit_text(
-        f"*{title}*\n\n{body}",
-        reply_markup=lessons_keyboard(TRADING_LESSONS, "trading")
+        f"{title}\n\n{body}",
+        reply_markup=lessons_keyboard(TRADING_LESSONS, "trading"),
+        parse_mode=None,
     )
     await call.answer()
 
@@ -594,9 +597,11 @@ async def traffic_education(message: types.Message):
 async def traffic_lesson_callback(call: types.CallbackQuery):
     idx = int(call.data.split(":")[1])
     title, body = TRAFFIC_LESSONS[idx]
+
     await call.message.edit_text(
-        f"*{title}*\n\n{body}",
-        reply_markup=lessons_keyboard(TRAFFIC_LESSONS, "traffic")
+        f"{title}\n\n{body}",
+        reply_markup=lessons_keyboard(TRAFFIC_LESSONS, "traffic"),
+        parse_mode=None,
     )
     await call.answer()
 
@@ -730,18 +735,23 @@ async def i_paid(message: types.Message):
     pid, uid, base_amount, unique_amount, status, created_at, confirmed_at, tx_amount, tx_time, tx_id = purchase
 
     found = await check_payment_for_purchase(purchase)
-    if found:
+        if found:
         await after_success_payment(purchase, manual_check=True)
     else:
+        # оставляем ту же клавиатуру, чтобы можно было нажимать "Я оплатил" сколько угодно
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row(KeyboardButton("✅ Я оплатил"), KeyboardButton("⬅️ В меню"))
+
         await message.answer(
             "❌ Пока не вижу платёж с твоей уникальной суммой.\n"
             "Если ты только что отправил — подожди 1–2 минуты и нажми ещё раз.\n"
             f"Если есть сомнения — напиши в поддержку: {SUPPORT_CONTACT}",
-            reply_markup=main_keyboard(),
+            reply_markup=kb,
         )
         await log_to_admin(
             f"Пользователь {message.from_user.id} нажал 'Я оплатил', но платёж не найден автоматически."
         )
+
 
 
 @dp.message_handler(Text(equals="⬅️ В меню"))
