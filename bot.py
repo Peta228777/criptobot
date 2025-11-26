@@ -756,6 +756,21 @@ async def cb_back_main(call: types.CallbackQuery):
 
 
 # --------------------- СИГНАЛЫ И ПРОДЛЕНИЕ ---------------------
+# ===== ТЕСТ КНОПКИ ДЛЯ ДИАГНОСТИКИ =====
+
+@dp.message_handler(commands=["testbtn"])
+async def cmd_testbtn(message: types.Message):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Тестовая кнопка ✅", callback_data="test_button"))
+    await message.answer("Жми на тестовую кнопку ниже:", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data == "test_button")
+async def cb_test_button(call: types.CallbackQuery):
+    await call.answer("Кнопка работает ✅", show_alert=True)
+
+
+
 
 
 @dp.message_handler(lambda m: m.text == "📈 Сигналы по торговле")
