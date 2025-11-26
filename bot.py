@@ -717,6 +717,7 @@ async def cb_lesson(call: types.CallbackQuery):
 async def send_lesson(message: types.Message, user_id: int, module_key: str, index: int):
     if module_key not in COURSE:
         return
+
     title, lessons = COURSE[module_key]
     index = max(0, min(index, len(lessons) - 1))
     last = index == len(lessons) - 1
@@ -726,8 +727,16 @@ async def send_lesson(message: types.Message, user_id: int, module_key: str, ind
 
     set_progress(user_id, module_key, index)
 
-    # всегда отправляем НОВОЕ сообщение, не редактируем старое
     await message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: True)
+async def debug_all_callbacks(call: types.CallbackQuery):
+    logging.info(f"DEBUG CALLBACK: {call.data}")
+    try:
+        await call.message.answer(f"DEBUG: {call.data}")
+    except Exception as e:
+        logging.exception("debug callback error: %s", e)
+    await call.answer()
 
 
 
@@ -735,9 +744,15 @@ async def send_lesson(message: types.Message, user_id: int, module_key: str, ind
 async def cb_back_main(call: types.CallbackQuery):
     user = get_user_by_tg(call.from_user.id)
     has_package = bool(user[7]) if user else False
-    await call.message.answer("Главное меню обновлено 👇", reply_markup=back_main_inline())
-    await call.message.answer("Выбери нужный раздел:", reply_markup=main_menu(has_package))
+
+    try:
+        await call.message.answer("Главное меню обновлено 👇")
+        await call.message.answer("Выбери нужный раздел:", reply_markup=main_menu(has_package))
+    except Exception as e:
+        logging.exception("back_main error: %s", e)
+
     await call.answer()
+
 
 
 # --------------------- СИГНАЛЫ И ПРОДЛЕНИЕ ---------------------
