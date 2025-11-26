@@ -660,13 +660,16 @@ async def traffic_training(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data == "back_training")
 async def cb_back_training(call: types.CallbackQuery):
-    await call.message.edit_text(
-        "🎓 <b>Меню обучения</b>\n\n"
-        "Выбери действие:",
-        reply_markup=training_menu_keyboard(),
-    )
+    try:
+        await call.message.answer(
+            "🎓 <b>Меню обучения</b>\n\n"
+            "Выбери действие:",
+            reply_markup=training_menu_keyboard(),
+        )
+    except Exception as e:
+        logging.exception("back_training error: %s", e)
     await call.answer()
-
+    
 
 @dp.callback_query_handler(lambda c: c.data == "train_structure")
 async def cb_train_structure(call: types.CallbackQuery):
@@ -674,7 +677,12 @@ async def cb_train_structure(call: types.CallbackQuery):
     for _key, (title, lessons) in COURSE.items():
         text_lines.append(f"• {title} — {len(lessons)} урок(ов)")
     text_lines.append("\nНажми «Продолжить обучение», чтобы вернуться к своему месту.")
-    await call.message.edit_text("\n".join(text_lines), reply_markup=modules_keyboard())
+
+    try:
+        # вместо edit_text просто отправляем новое сообщение
+        await call.message.answer("\n".join(text_lines), reply_markup=modules_keyboard())
+    except Exception as e:
+        logging.exception("train_structure error: %s", e)
     await call.answer()
 
 
@@ -687,14 +695,14 @@ async def cb_train_start(call: types.CallbackQuery):
         module_key = list(COURSE.keys())[0]
         lesson_index = 0
 
-    await send_lesson(call.message, user_id, module_key, lesson_index, edit=True)
+    await send_lesson(call.message, user_id, module_key, lesson_index, edit=False)
     await call.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("module:"))
 async def cb_module(call: types.CallbackQuery):
     _, module_key, _ = call.data.split(":")
-    await send_lesson(call.message, call.from_user.id, module_key, 0, edit=True)
+    await send_lesson(call.message, call.from_user.id, module_key, 0, edit=False)
     await call.answer()
 
 
@@ -702,7 +710,7 @@ async def cb_module(call: types.CallbackQuery):
 async def cb_lesson(call: types.CallbackQuery):
     _, module_key, idx = call.data.split(":")
     index = int(idx)
-    await send_lesson(call.message, call.from_user.id, module_key, index, edit=True)
+    await send_lesson(call.message, call.from_user.id, module_key, index, edit=False)
     await call.answer()
 
 
@@ -717,6 +725,10 @@ async def send_lesson(message: types.Message, user_id: int, module_key: str, ind
     kb = lesson_nav_keyboard(module_key, index, last)
 
     set_progress(user_id, module_key, index)
+
+    # всегда отправляем НОВОЕ сообщение, не редактируем старое
+    await message.answer(text, reply_markup=kb)
+
 
     if edit:
         await message.edit_text(text, reply_markup=kb)
