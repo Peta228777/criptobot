@@ -1029,12 +1029,14 @@ def main_menu():
 
 
 
-def training_menu_keyboard(course: str):
+
+def traffic_training_menu_keyboard():
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("▶️ Продолжить обучение", callback_data=f"train_start:{course}"))
-    kb.add(InlineKeyboardButton("📚 Структура курса", callback_data=f"train_structure:{course}"))
+    kb.add(InlineKeyboardButton("▶️ Начать / продолжить обучение", callback_data="traffic_start"))
+    kb.add(InlineKeyboardButton("📚 Структура курса", callback_data="traffic_structure"))
     kb.add(InlineKeyboardButton("⬅️ В главное меню", callback_data="back_main"))
     return kb
+
 
 
 def modules_keyboard(course: str):
@@ -1155,42 +1157,33 @@ async def help_you_earn(message: types.Message):
 
 
 
-@dp.message_handler(lambda m: m.text == "📚 Обучение по крипте")
-async def training_crypto_menu(message: types.Message):
+# 🎓 ОБУЧЕНИЕ ТРЕЙДИНГУ
+@dp.message_handler(lambda m: m.text == "🎓 Обучение трейдингу")
+async def training_menu(message: types.Message):
     if is_spam(message.from_user.id):
         return
-
-    user_row = get_user_by_tg(message.from_user.id)
-    if not user_row:
-        user_db_id = get_or_create_user(message)
-    else:
-        user_db_id = user_row[0]
-
-    if not has_paid_package(user_db_id):
-        await send_package_payment_instructions(message, user_db_id)
-        return
-
     await message.answer(
-        "📚 <b>Обучение по крипте</b>\n\n"
-        "База по рынку, психологии, риску и торговой системе.\n\n"
+        "🎓 <b>Обучение трейдингу</b>\n\n"
+        "Это пошаговый курс, который можно проходить в удобном темпе. "
+        "Каждый модуль раскрывает отдельный блок: психология, риск-менеджмент, сама стратегия.\n\n"
         "Выбери действие:",
-        reply_markup=training_menu_keyboard("crypto"),
+        reply_markup=training_menu_keyboard(),  # ЭТА функция у тебя уже была
     )
 
 
+# 📣 ОБУЧЕНИЕ ПЕРЕЛИВУ ТРАФИКА
 @dp.message_handler(lambda m: m.text == "📣 Обучение переливу трафика")
 async def traffic_training_menu(message: types.Message):
     if is_spam(message.from_user.id):
         return
-
     await message.answer(
         "📣 <b>Обучение по переливу трафика</b>\n\n"
         "Здесь собран отдельный курс, как снимать контент, "
         "приводить людей из TikTok в бота и зарабатывать на партнёрке.\n\n"
         "Нажми кнопку ниже, чтобы перейти к урокам 👇",
-        # здесь используем свою клавиатуру для курса по трафику
-        reply_markup=traffic_training_menu_keyboard(),  
+        reply_markup=traffic_training_menu_keyboard(),
     )
+
 
 
 
