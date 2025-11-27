@@ -1242,3 +1242,4 @@ if __name__ == "__main__":
         on_startup=on_startup,
         allowed_updates=["message", "callback_query"],
     )
+
