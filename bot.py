@@ -890,7 +890,7 @@ async def cmd_start(message: types.Message):
     "Без воды и мотивашек — только конкретика и рабочие инструменты."
       )
 
-    )
+   )
 
     await message.answer(text, reply_markup=main_reply_kb())
     await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
