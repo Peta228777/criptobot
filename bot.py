@@ -792,7 +792,6 @@ def edu_main_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📈 Курс по трейдингу", callback_data="edu_crypto"))
     kb.add(InlineKeyboardButton("🚀 Курс по трафику", callback_data="edu_traffic"))
-    kb.add(InlineKeyboardButton("📚 Структура обучения", callback_data="edu_structure"))
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
 
@@ -808,6 +807,7 @@ def earn_main_kb():
     kb.add(InlineKeyboardButton("📎 Подробнее про партнёрку", callback_data="earn_more"))
     kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
     kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
+    kd.add(InlineKeyboardButton("📡 Канал с сигналами", url=SIGNALS_CHANNEL_ID))
     kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
     kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
     return kb
