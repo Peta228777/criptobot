@@ -963,7 +963,6 @@ async def cb_home_how(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=start_inline_kb())
     await call.answer()
-kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
 
 @dp.callback_query_handler(lambda c: c.data == "back_home")
 async def cb_back_home(call: CallbackQuery):
