@@ -38,7 +38,7 @@ USDT_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
 
 # ID канала с сигналами (число, например -1001234567890)
 # TODO: вставь сюда ID своего канала с сигналами
-SIGNALS_CHANNEL_ID = -1001234567890
+SIGNALS_CHANNEL_ID = "https://t.me/fjsidjdjjs"
 
 # Ссылка на сигнальный канал (на случай, если удобнее давать ссылку)
 SIGNALS_CHANNEL_LINK = "https://t.me/your_signals_channel"
