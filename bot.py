@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 import aiohttp
 from aiogram import Bot, Dispatcher, executor, types
+from auto_signals import auto_signals_worker
 from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -42,6 +43,15 @@ SIGNALS_CHANNEL_URL = "https://t.me/fjsidjdjjs"
 
 # Ссылка на сигнальный канал (на случай, если удобнее давать ссылку)
 SIGNALS_CHANNEL_ID = -1003464806734
+
+
+# Ссылка на сигнальный канал (для кнопок и сообщений)
+SIGNALS_CHANNEL_LINK = "https://t.me/fjsidjdjjs"  # 👈 сюда реальную ссылку
+
+# Авто-сигналы
+AUTO_SIGNALS_ENABLED = True          # если захочешь вырубить — поставишь False
+AUTO_SIGNALS_PER_DAY = 5             # примерно сколько сигналов в сутки
+AUTO_SIGNALS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]  # пары для сигналов
 
 # Ссылки на обучающие каналы
 TRADING_EDU_CHANNEL = "https://t.me/your_trading_edu_channel"
@@ -1817,7 +1827,17 @@ async def fallback(message: types.Message):
 async def on_startup(dp: Dispatcher):
     init_db()
     asyncio.create_task(signals_watcher())
+    asyncio.create_task(
+        auto_signals_worker(
+            bot,
+            SIGNALS_CHANNEL_ID,
+            AUTO_SIGNALS_PER_DAY,
+            AUTO_SIGNALS_SYMBOLS,
+            AUTO_SIGNALS_ENABLED,
+        )
+    )
     logger.info("Bot started and DB initialized.")
+
 
 
 if __name__ == "__main__":
