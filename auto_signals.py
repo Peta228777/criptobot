@@ -11,27 +11,41 @@ from aiogram import Bot
 
 logger = logging.getLogger(__name__)
 
-# Базовый URL Binance для публичного API
-BINANCE_API_BASE = "https://api.binance.com"
+# Базовый URL CoinGecko
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+
+# Маппинг наших пар на ID в CoinGecko
+COINGECKO_IDS = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "BNBUSDT": "binancecoin",
+    # если добавишь пары в AUTO_SIGNALS_SYMBOLS – не забудь дописать сюда
+}
 
 
-async def fetch_binance_24h(symbol: str) -> Optional[dict]:
+async def fetch_coingecko_price(coin_id: str) -> Optional[dict]:
     """
-    Берём статистику за 24 часа по символу с публичного API Binance.
+    Берём цену и 24h изменение по монете с CoinGecko.
+    Используем /simple/price с vs_currencies=usd и include_24hr_change=true.
     """
-    url = f"{BINANCE_API_BASE}/api/v3/ticker/24hr"
-    params = {"symbol": symbol}
+    url = f"{COINGECKO_API_BASE}/simple/price"
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true",
+    }
 
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params, timeout=10) as resp:
                 if resp.status != 200:
-                    logger.warning("Binance 24h ticker %s status %s", symbol, resp.status)
+                    logger.warning("CoinGecko price %s status %s", coin_id, resp.status)
                     return None
                 data = await resp.json()
                 return data
         except Exception as e:
-            logger.error("Error fetching Binance 24h ticker for %s: %s", symbol, e)
+            logger.error("Error fetching CoinGecko price for %s: %s", coin_id, e)
             return None
 
 
@@ -57,28 +71,34 @@ async def build_auto_signal_text(
     """
     Генерим авто-сигнал по случайному инструменту:
     направление + вход + SL + два TP.
-    Это не финрекомендация, а автоген по простой логике.
+    Данные берём с CoinGecko (цена в USD и 24h изменение).
     """
     if not enabled:
         return None
 
     symbols = list(symbols) or ["BTCUSDT"]
-    symbol = random.choice(symbols)
+    pair = random.choice(symbols)
 
-    data = await fetch_binance_24h(symbol)
-    if not data:
+    coin_id = COINGECKO_IDS.get(pair)
+    if not coin_id:
+        logger.warning("No CoinGecko ID for pair %s", pair)
         return None
 
-    last_price = data.get("lastPrice")
-    change_percent = data.get("priceChangePercent")
+    data = await fetch_coingecko_price(coin_id)
+    if not data or coin_id not in data:
+        return None
+
+    coin_data = data[coin_id]
+    price_usd = coin_data.get("usd")
+    change_percent = coin_data.get("usd_24h_change")
 
     try:
-        price = Decimal(str(last_price))
+        price = Decimal(str(price_usd))
     except Exception:
         return None
 
     try:
-        chg = Decimal(str(change_percent))
+        chg = Decimal(str(change_percent)) if change_percent is not None else None
     except Exception:
         chg = None
 
@@ -95,10 +115,10 @@ async def build_auto_signal_text(
         else:
             idea = "⚪ Рынок во флете, явного тренда за 24ч нет. Сигнал без конкретных уровней."
 
-    # Если нет направленного тренда — обзор без уровней
+    # Если нет направленного тренда — просто обзор без уровней
     if not direction:
         parts = [
-            f"📡 <b>Авто-сигнал</b> по <b>{symbol}</b>",
+            f"📡 <b>Авто-сигнал</b> по <b>{pair}</b>",
             f"Текущая цена: <b>{_format_price(price)}</b> USDT",
         ]
         if chg is not None:
@@ -110,7 +130,7 @@ async def build_auto_signal_text(
         parts.append("⚠️ Это автоматический технический сигнал от бота, не финансовая рекомендация.")
         return "\n".join(parts)
 
-    # Считаем вход / стоп / тейки (очень простая модель по % от цены)
+    # Считаем вход / стоп / тейки (простая модель по % от цены)
     entry = price
 
     if direction == "long":
@@ -125,7 +145,7 @@ async def build_auto_signal_text(
         dir_text = "SHORT"
 
     parts = [
-        f"📡 <b>Авто-сигнал</b> по <b>{symbol}</b>",
+        f"📡 <b>Авто-сигнал</b> по <b>{pair}</b>",
         f"Текущая цена: <b>{_format_price(price)}</b> USDT",
     ]
     if chg is not None:
@@ -155,7 +175,7 @@ async def auto_signals_worker(
     enabled: bool,
 ) -> None:
     """
-    Фоновая задача: раз в N часов шлёт авто-сигнал в канал.
+    Фоновая задача: раз в N секунд шлёт авто-сигнал в канал.
     """
     if not enabled:
         logger.info("Auto signals disabled, worker not started.")
@@ -167,7 +187,7 @@ async def auto_signals_worker(
 
     interval = int(24 * 3600 / max(auto_signals_per_day, 1))
 
-    # чуть ждём старта бота
+    # немного ждём старт бота
     await asyncio.sleep(15)
 
     while True:
