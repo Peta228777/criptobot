@@ -126,8 +126,6 @@ async def build_auto_signal_text(
         if idea:
             parts.append("")
             parts.append(idea)
-        parts.append("")
-        parts.append("⚠️ Это автоматический технический сигнал от бота, не финансовая рекомендация.")
         return "\n".join(parts)
 
     # Считаем вход / стоп / тейки (простая модель по % от цены)
