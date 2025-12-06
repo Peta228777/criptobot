@@ -5,37 +5,44 @@ import random
 import logging
 from decimal import Decimal
 from typing import Optional, Sequence
-from datetime import datetime  # 👈 добавили
+from datetime import datetime
 
 import aiohttp
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 
-# Тихие часы для авто-сигналов (по локальному времени)
-QUIET_HOURS_ENABLED = True     # выключить ночной режим — поставь False
-QUIET_HOURS_START = 0          # c 00:00
-QUIET_HOURS_END = 8            # до 08:00 не слать сигналы
-QUIET_HOURS_UTC_OFFSET = 2     # сдвиг от UTC (Киев зимой +2, летом можно поставить 3)
+# --- ТИХИЕ ЧАСЫ (по твоему локальному времени) ---
 
+QUIET_HOURS_ENABLED = True      # если False — сигналы круглосуточно
+QUIET_HOURS_START = 0           # c 00:00
+QUIET_HOURS_END = 8             # до 08:00 сигналы не шлём
+QUIET_HOURS_UTC_OFFSET = 2      # смещение от UTC (Киев зимой +2, летом можно поставить 3)
 
-# Базовый URL CoinGecko
+# --- МОДЕРАЦИЯ АВТО-СИГНАЛОВ ---
+
+MODERATION_ENABLED = False       # True = сначала тебе на approve, потом в канал
+ADMIN_ID_FOR_SIGNALS = 682938643  # Поставь тот же ID, что ADMIN_ID в bot.py
+
+# --- CoinGecko ---
+
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
-# Маппинг наших пар на ID в CoinGecko
+# Маппинг наших пар на CoinGecko ID
 COINGECKO_IDS = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
     "SOLUSDT": "solana",
     "BNBUSDT": "binancecoin",
-    # если добавишь пары в AUTO_SIGNALS_SYMBOLS – не забудь дописать сюда
+    # если добавишь пары в AUTO_SIGNALS_SYMBOLS — допиши сюда ID
 }
 
 
 async def fetch_coingecko_price(coin_id: str) -> Optional[dict]:
     """
     Берём цену и 24h изменение по монете с CoinGecko.
-    Используем /simple/price с vs_currencies=usd и include_24hr_change=true.
+    /simple/price с vs_currencies=usd и include_24hr_change=true.
     """
     url = f"{COINGECKO_API_BASE}/simple/price"
     params = {
@@ -59,7 +66,7 @@ async def fetch_coingecko_price(coin_id: str) -> Optional[dict]:
 
 def _format_price(p: Decimal) -> str:
     """
-    Примитивное форматирование: чем меньше цена, тем больше знаков.
+    Примитивное форматирование: чем больше цена, тем меньше знаков после запятой.
     """
     if p >= Decimal("100"):
         q = p.quantize(Decimal("0.1"))
@@ -113,7 +120,7 @@ async def build_auto_signal_text(
     except Exception:
         chg = None
 
-    # Если не смогли посчитать изменение — просто выходим
+    # Если не смогли посчитать изменение — выходим
     if chg is None:
         return None
 
@@ -123,7 +130,7 @@ async def build_auto_signal_text(
         # меньше 1.5% за сутки — флет, сигнал не даём
         return None
     if abs_chg > Decimal("18"):
-        # больше 18% за сутки — слишком агрессивный памп/дамп, тоже пропускаем
+        # больше 18% — слишком агрессивный памп/дамп, тоже пропускаем
         return None
 
     # Определяем направление
@@ -134,7 +141,6 @@ async def build_auto_signal_text(
         direction = "short"
         idea = "🔴 Идея: SHORT (преобладает нисходящее движение за 24ч)"
     else:
-        # сюда в теории не попадём из-за фильтра, но пусть будет
         direction = None
         idea = "⚪ Рынок во флете, явного тренда за 24ч нет. Сигнал без конкретных уровней."
 
@@ -199,7 +205,6 @@ async def build_auto_signal_text(
     return "\n".join(parts)
 
 
-
 async def auto_signals_worker(
     bot: Bot,
     signals_channel_id: int,
@@ -208,7 +213,9 @@ async def auto_signals_worker(
     enabled: bool,
 ) -> None:
     """
-    Фоновая задача: раз в N секунд шлёт авто-сигнал в канал.
+    Фоновая задача: раз в N секунд генерит авто-сигнал.
+    • Учитывает тихие часы
+    • При включённой модерации шлёт сигнал админу на approve/skip
     """
     if not enabled:
         logger.info("Auto signals disabled, worker not started.")
@@ -225,30 +232,47 @@ async def auto_signals_worker(
 
     while True:
         try:
-            # Определяем локальный час с учётом сдвига
+            # Проверяем тихие часы
             now_utc = datetime.utcnow()
             local_hour = (now_utc.hour + QUIET_HOURS_UTC_OFFSET) % 24
 
             in_quiet = False
             if QUIET_HOURS_ENABLED:
                 if QUIET_HOURS_START <= QUIET_HOURS_END:
-                    # обычный диапазон, напр. 0–7
                     in_quiet = QUIET_HOURS_START <= local_hour < QUIET_HOURS_END
                 else:
-                    # диапазон через полночь, напр. 22–6
+                    # диапазон через полночь, напр. 23–7
                     in_quiet = local_hour >= QUIET_HOURS_START or local_hour < QUIET_HOURS_END
 
             if in_quiet:
-                logger.info(
-                    "Auto signal skipped due to quiet hours (local hour=%s)", local_hour
-                )
+                logger.info("Auto signal skipped due to quiet hours (local hour=%s)", local_hour)
             else:
                 text = await build_auto_signal_text(symbols, enabled)
                 if text:
-                    await bot.send_message(signals_channel_id, text)
-                    logger.info("Auto signal sent to %s", signals_channel_id)
+                    if MODERATION_ENABLED:
+                        # сначала шлём админу на модерацию
+                        kb = InlineKeyboardMarkup()
+                        kb.add(
+                            InlineKeyboardButton(
+                                "✅ Отправить в канал", callback_data="auto_sig_approve"
+                            )
+                        )
+                        kb.add(
+                            InlineKeyboardButton(
+                                "❌ Пропустить", callback_data="auto_sig_skip"
+                            )
+                        )
+                        await bot.send_message(
+                            ADMIN_ID_FOR_SIGNALS,
+                            text + "\n\n<b>Отправить этот сигнал в канал?</b>",
+                            reply_markup=kb,
+                        )
+                        logger.info("Auto signal sent to admin %s for moderation", ADMIN_ID_FOR_SIGNALS)
+                    else:
+                        # сразу в канал
+                        await bot.send_message(signals_channel_id, text)
+                        logger.info("Auto signal sent to %s", signals_channel_id)
         except Exception as e:
             logger.error("Auto signals worker error: %s", e)
 
         await asyncio.sleep(interval)
-
