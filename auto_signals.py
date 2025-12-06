@@ -5,11 +5,19 @@ import random
 import logging
 from decimal import Decimal
 from typing import Optional, Sequence
+from datetime import datetime  # 👈 добавили
 
 import aiohttp
 from aiogram import Bot
 
 logger = logging.getLogger(__name__)
+
+# Тихие часы для авто-сигналов (по локальному времени)
+QUIET_HOURS_ENABLED = True     # выключить ночной режим — поставь False
+QUIET_HOURS_START = 0          # c 00:00
+QUIET_HOURS_END = 8            # до 08:00 не слать сигналы
+QUIET_HOURS_UTC_OFFSET = 2     # сдвиг от UTC (Киев зимой +2, летом можно поставить 3)
+
 
 # Базовый URL CoinGecko
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -191,42 +199,6 @@ async def build_auto_signal_text(
     return "\n".join(parts)
 
 
-    # Считаем вход / стоп / тейки (простая модель по % от цены)
-    entry = price
-
-    if direction == "long":
-        sl = entry * (Decimal("1") - Decimal("0.01"))   # -1%
-        tp1 = entry * (Decimal("1") + Decimal("0.02"))  # +2%
-        tp2 = entry * (Decimal("1") + Decimal("0.04"))  # +4%
-        dir_text = "LONG"
-    else:  # short
-        sl = entry * (Decimal("1") + Decimal("0.01"))   # +1%
-        tp1 = entry * (Decimal("1") - Decimal("0.02"))  # -2%
-        tp2 = entry * (Decimal("1") - Decimal("0.04"))  # -4%
-        dir_text = "SHORT"
-
-    parts = [
-        f"📡 <b>Авто-сигнал</b> по <b>{pair}</b>",
-        f"Текущая цена: <b>{_format_price(price)}</b> USDT",
-    ]
-    if chg is not None:
-        parts.append(f"Изменение за 24ч: <b>{chg}%</b>")
-    if idea:
-        parts.append("")
-        parts.append(idea)
-
-    parts.append("")
-    parts.append(f"📊 <b>Параметры сделки ({dir_text})</b>")
-    parts.append(f"Вход: <b>{_format_price(entry)}</b> USDT")
-    parts.append(f"Стоп-лосс: <b>{_format_price(sl)}</b> USDT")
-    parts.append(f"Тейк-профит 1: <b>{_format_price(tp1)}</b> USDT")
-    parts.append(f"Тейк-профит 2: <b>{_format_price(tp2)}</b> USDT")
-
-    parts.append("")
-    parts.append("⚠️ Это автоматический технический сигнал от бота, не финансовая рекомендация.")
-
-    return "\n".join(parts)
-
 
 async def auto_signals_worker(
     bot: Bot,
@@ -253,11 +225,30 @@ async def auto_signals_worker(
 
     while True:
         try:
-            text = await build_auto_signal_text(symbols, enabled)
-            if text:
-                await bot.send_message(signals_channel_id, text)
-                logger.info("Auto signal sent to %s", signals_channel_id)
+            # Определяем локальный час с учётом сдвига
+            now_utc = datetime.utcnow()
+            local_hour = (now_utc.hour + QUIET_HOURS_UTC_OFFSET) % 24
+
+            in_quiet = False
+            if QUIET_HOURS_ENABLED:
+                if QUIET_HOURS_START <= QUIET_HOURS_END:
+                    # обычный диапазон, напр. 0–7
+                    in_quiet = QUIET_HOURS_START <= local_hour < QUIET_HOURS_END
+                else:
+                    # диапазон через полночь, напр. 22–6
+                    in_quiet = local_hour >= QUIET_HOURS_START or local_hour < QUIET_HOURS_END
+
+            if in_quiet:
+                logger.info(
+                    "Auto signal skipped due to quiet hours (local hour=%s)", local_hour
+                )
+            else:
+                text = await build_auto_signal_text(symbols, enabled)
+                if text:
+                    await bot.send_message(signals_channel_id, text)
+                    logger.info("Auto signal sent to %s", signals_channel_id)
         except Exception as e:
             logger.error("Auto signals worker error: %s", e)
 
         await asyncio.sleep(interval)
+
