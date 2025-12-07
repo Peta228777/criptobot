@@ -1,364 +1,1897 @@
-import asyncio
 import logging
-import random
 import sqlite3
-import csv
+import asyncio
+import random
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 
 import aiohttp
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram import Bot, Dispatcher, executor, types
+from auto_signals import auto_signals_worker, build_auto_signal_text
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
 
-# ==========================
+# ---------------------------------------------------------------------------
 # НАСТРОЙКИ
-# ==========================
+# ---------------------------------------------------------------------------
 
+# TODO: если хочешь, можешь вернуть сюда чтение из .env, но по твоей просьбе — вставляю сразу константой
 BOT_TOKEN = "8330326273:AAEuWSwkqi7ypz1LZL4LXRr2jSMpKjGc36k"
+
+# твой админ ID (из прошлых файлов)
 ADMIN_ID = 682938643
 
+# Tron / TronGrid
+# TODO: сюда вставь свой ключ TronGrid, который ты мне отправлял (GUID вида xxxx-xxxx-xxxx)
 TRONGRID_API_KEY = "b33b8d65-10c9-4f7b-99e0-ab47f3bbb60f"
-WALLET_ADDRESS = "TSY9xf24bQ3Kbd1Njp2w4pEEoqJow1nfpr"
-CHANNEL_ID = -1003464806734   # закрытый канал
 
-PRICE_USDT = 50
-SUB_DAYS = 30
+# TODO: сюда вставь свой TRON-кошелёк, на который люди отправляют USDT (TRC20)
+WALLET_ADDRESS = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+
+# Стандартный контракт USDT TRC20 (можно не менять)
+USDT_CONTRACT = "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+
+# ID канала с сигналами (число, например -1001234567890)
+# TODO: вставь сюда ID своего канала с сигналами
+SIGNALS_CHANNEL_URL = "https://t.me/fjsidjdjjs"
+
+# Ссылка на сигнальный канал (на случай, если удобнее давать ссылку)
+SIGNALS_CHANNEL_ID = -1003464806734
+
+
+# Ссылка на сигнальный канал (для кнопок и сообщений)
+SIGNALS_CHANNEL_LINK = "https://t.me/fjsidjdjjs"  # 👈 сюда реальную ссылку
+
+# Авто-сигналы
+AUTO_SIGNALS_ENABLED = True          # если захочешь вырубить — поставишь False
+AUTO_SIGNALS_PER_DAY = 5             # примерно сколько сигналов в сутки
+AUTO_SIGNALS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]  # пары для сигналов
+
+# Ссылки на обучающие каналы
+TRADING_EDU_CHANNEL = "https://t.me/your_trading_edu_channel"
+TRAFFIC_EDU_CHANNEL = "https://t.me/your_traffic_edu_channel"
+
+# Контакт поддержки
+SUPPORT_CONTACT = "@support"  # при желании поменяешь на свой @ник
+
+# Цены и проценты
+PRICE_PACKAGE = Decimal("100")   # полный доступ
+PRICE_RENEWAL = Decimal("50")    # продление сигналов
+LEVEL1_PERCENT = Decimal("0.5")  # 50%
+LEVEL2_PERCENT = Decimal("0.1")  # 10%
 
 DB_PATH = "database.db"
 
-EXPIRE_CHECK_INTERVAL = 1800
-PAYMENT_SCAN_INTERVAL = 60
-
-# ==========================
-# ИНИЦИАЛИЗАЦИЯ
-# ==========================
+# Антиспам (минимальный интервал между сообщениями)
+ANTISPAM_SECONDS = 1.2
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
 
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
+# ---------------------------------------------------------------------------
+# БАЗА ДАННЫХ
+# ---------------------------------------------------------------------------
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS subscriptions(
-        user_id INTEGER PRIMARY KEY,
-        unique_price REAL,
-        paid INTEGER,
-        start_date TEXT,
-        end_date TEXT,
-        tx_amount REAL,
-        tx_time TEXT
-    );
-    """
-)
 
-cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_seen TEXT,
-        last_active TEXT
-    );
-    """
-)
+def db_connect():
+    return sqlite3.connect(DB_PATH)
 
-conn.commit()
 
-user_unique_price: dict[int, float] = {}
+def init_db():
+    conn = db_connect()
+    cur = conn.cursor()
 
-# ==========================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==========================
-
-def is_admin(message: types.Message) -> bool:
-    return message.from_user.id == ADMIN_ID
-
-def save_user(user_id: int, username: str | None):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cursor.execute(
+    # Пользователи
+    cur.execute(
         """
-        INSERT INTO users (user_id, username, first_seen, last_active)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET last_active = excluded.last_active
-        """,
-        (user_id, username or "", now, now),
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,
+            username TEXT,
+            first_name TEXT,
+            referrer_id INTEGER,
+            balance REAL DEFAULT 0,
+            total_earned REAL DEFAULT 0,
+            reg_date TEXT,
+            full_access INTEGER DEFAULT 0,   -- 0/1, полный пакет за 100$
+            is_blocked INTEGER DEFAULT 0     -- 0/1, блокировка
+        )
+        """
     )
-    conn.commit()
 
-def get_subscription(user_id: int):
-    cursor.execute(
-        "SELECT * FROM subscriptions WHERE user_id = ?",
+    # Покупки (пакет / продления)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            product_code TEXT,              -- "package" / "renewal"
+            amount REAL,
+            status TEXT,                    -- "pending" / "paid"
+            created_at TEXT,
+            paid_at TEXT,
+            tx_id TEXT
+        )
+        """
+    )
+
+    # Подписка на сигналы
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signals_access (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE,      -- ссылка на users.id
+            active_until TEXT            -- UTC datetime (YYYY-mm-dd HH:MM:SS)
+        )
+        """
+    )
+
+    # Прогресс по курсам (отдельно трейдинг и трафик)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            course TEXT,                -- "crypto" / "traffic"
+            module_index INTEGER,
+            UNIQUE (user_id, course)
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_or_create_user(message: types.Message, referrer_id_db: int = None) -> int:
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or ""
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM users WHERE user_id = ?",
         (user_id,),
     )
-    return cursor.fetchone()
-
-def save_payment(user_id: int, unique_price: float, tx_amount: float):
-    now = datetime.now()
-    end = now + timedelta(days=SUB_DAYS)
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO subscriptions
-        (user_id, unique_price, paid, start_date, end_date, tx_amount, tx_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            unique_price,
-            1,
-            now.strftime("%Y-%m-%d %H:%M"),
-            end.strftime("%Y-%m-%d %H:%M"),
-            tx_amount,
-            now.strftime("%Y-%m-%d %H:%M"),
-        ),
-    )
-    conn.commit()
-
-def set_paid(user_id: int, paid: int):
-    cursor.execute("UPDATE subscriptions SET paid = ? WHERE user_id = ?", (paid, user_id))
-    conn.commit()
-
-async def log_to_admin(text: str):
-    try:
-        await bot.send_message(ADMIN_ID, f"🛠 LOG:\n{text}")
-    except:
-        pass
-
-# ==========================
-# ПРОВЕРКА ОПЛАТ TRONGRID
-# ==========================
-
-async def check_trx_payment(user_id: int) -> bool:
-    target_amount = user_unique_price.get(user_id)
-    if target_amount is None:
-        return False
-
-    url = f"https://api.trongrid.io/v1/accounts/{WALLET_ADDRESS}/transactions/trc20"
-    headers = {"TRON-PRO-API-KEY": TRONGRID_API_KEY}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            data = await resp.json()
-
-    for tx in data.get("data", []):
-        try:
-            raw_value = tx.get("value") or tx.get("amount")
-            if raw_value is None:
-                continue
-            amount = int(raw_value) / 1_000_000
-            if abs(amount - target_amount) < 0.000001:
-                return True
-        except:
-            continue
-
-    return False
-
-
-# ==========================
-# КЛАВИАТУРЫ
-# ==========================
-
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[
-            [KeyboardButton("📌 О боте"), KeyboardButton("📈 Получить сигналы")],
-            [KeyboardButton("💰 Тарифы"), KeyboardButton("📞 Поддержка")],
-            [KeyboardButton("👤 Профиль")],
-        ],
-    )
-
-def admin_keyboard():
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[
-            [KeyboardButton("👥 Все пользователи")],
-            [KeyboardButton("📊 Все подписчики")],
-            [KeyboardButton("🔥 Активные подписчики")],
-            [KeyboardButton("⏳ Истёкшие")],
-            [KeyboardButton("🧾 История платежей")],
-            [KeyboardButton("📤 Экспорт CSV")],
-        ],
-    )
-
-# ==========================
-# ОБЫЧНЫЕ КОМАНДЫ
-# ==========================
-
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    save_user(message.from_user.id, message.from_user.username)
-
-    row = get_subscription(message.from_user.id)
-    now = datetime.now()
+    row = cur.fetchone()
 
     if row:
-        _, _, paid, _, end_date, _, _ = row
-        try:
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d %H:%M")
-        except:
-            end_dt = now
+        user_db_id = row[0]
+        # на всякий случай обновляем логин / имя
+        cur.execute(
+            "UPDATE users SET username = ?, first_name = ? WHERE id = ?",
+            (username, first_name, user_db_id),
+        )
+        conn.commit()
+        conn.close()
+        return user_db_id
 
-        if paid == 1 and end_dt > now:
-            await message.answer(
-                f"🔥 У тебя есть активная подписка!\n"
-                f"До: *{end_date}*",
-                parse_mode="Markdown",
-            )
-
-    await message.answer(
-        "👋 Добро пожаловать в *Crypto Signals Bot*!",
-        reply_markup=main_keyboard(),
-        parse_mode="Markdown"
+    reg_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        INSERT INTO users (user_id, username, first_name, referrer_id, reg_date)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, username, first_name, referrer_id_db, reg_date),
     )
+    conn.commit()
+    user_db_id = cur.lastrowid
+    conn.close()
+    return user_db_id
 
 
-@dp.message_handler(lambda m: m.text == "📌 О боте")
-async def about(message: types.Message):
-    await message.answer(
-        "🤖 *Crypto Signals Bot*\n\n"
-        "📈 BTC/ETH/ALT сигналы\n"
-        "💰 USDT(TRC20)\n",
-        parse_mode="Markdown"
+def get_user_by_tg(user_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, username, first_name,
+               referrer_id, balance, total_earned, full_access
+        FROM users WHERE user_id = ?
+        """,
+        (user_id,),
     )
+    row = cur.fetchone()
+    conn.close()
+    return row
 
 
-@dp.message_handler(lambda m: m.text == "💰 Тарифы")
-async def tariffs(message: types.Message):
-    await message.answer(
-        f"💰 1 месяц — {PRICE_USDT} USDT\n"
-        f"💰 2 месяца — {PRICE_USDT+30} USDT",
-        parse_mode="Markdown"
+def set_full_access(user_db_id: int, value: bool = True):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET full_access = ? WHERE id = ?",
+        (1 if value else 0, user_db_id),
     )
+    conn.commit()
+    conn.close()
 
 
-@dp.message_handler(lambda m: m.text == "📞 Поддержка")
-async def support(message: types.Message):
-    await message.answer(
-        "Пиши сюда: @your_support_username",
-        parse_mode="Markdown"
+def has_full_access(user_db_id: int) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT full_access FROM users WHERE id = ?", (user_db_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+def create_purchase(user_db_id: int, product_code: str, base_price: Decimal) -> int:
+    """
+    Создаём покупку с уникальным хвостом (например 100.543).
+    """
+    # уникальный хвост до 0.999
+    tail = Decimal(random.randint(1, 999)) / Decimal("1000")
+    amount = (base_price + tail).quantize(Decimal("0.000"), rounding=ROUND_DOWN)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        INSERT INTO purchases (user_id, product_code, amount, status, created_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        """,
+        (user_db_id, product_code, float(amount), created_at),
     )
+    conn.commit()
+    purchase_id = cur.lastrowid
+    conn.close()
+    return purchase_id
 
-@dp.message_handler(lambda m: m.text == "👤 Профиль")
-async def profile(message: types.Message):
-    row = get_subscription(message.from_user.id)
-    now = datetime.now()
 
-    if not row:
-        return await message.answer("Нет подписки. Купи через «📈 Получить сигналы»")
+def get_purchase(purchase_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, product_code, amount, status, created_at, tx_id
+        FROM purchases WHERE id = ?
+        """,
+        (purchase_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-    user_id, unique_price, paid, start_date, end_date, tx_amount, tx_time = row
 
+def mark_purchase_paid(purchase_id: int, tx_id: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    paid_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute(
+        """
+        UPDATE purchases
+        SET status = 'paid', paid_at = ?, tx_id = ?
+        WHERE id = ?
+        """,
+        (paid_at, tx_id, purchase_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def extend_signals(user_db_id: int, days: int = 30):
+    conn = db_connect()
+    cur = conn.cursor()
+    now = datetime.utcnow()
+    cur.execute("SELECT active_until FROM signals_access WHERE user_id = ?", (user_db_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        current_until = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+        base = max(now, current_until)
+    else:
+        base = now
+    new_until = base + timedelta(days=days)
+    new_until_str = new_until.strftime("%Y-%m-%d %H:%M:%S")
+    if row:
+        cur.execute(
+            "UPDATE signals_access SET active_until = ? WHERE user_id = ?",
+            (new_until_str, user_db_id),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO signals_access (user_id, active_until) VALUES (?, ?)",
+            (user_db_id, new_until_str),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_signals_until(user_db_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT active_until FROM signals_access WHERE user_id = ?", (user_db_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        return None
     try:
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d %H:%M")
-    except:
-        end_dt = now
+        return datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
-    status = "🟢 Активна" if (paid == 1 and end_dt > now) else "🔴 Нет подписки"
-    days_left = max((end_dt - now).days, 0)
+
+def add_balance(user_db_id: int, amount: Decimal):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE users
+        SET balance = balance + ?, total_earned = total_earned + ?
+        WHERE id = ?
+        """,
+        (float(amount), float(amount), user_db_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_referrer_chain(user_db_id: int):
+    """
+    id первого и второго уровня (в таблице users)
+    """
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT referrer_id FROM users WHERE id = ?", (user_db_id,))
+    row = cur.fetchone()
+    lvl1_id = row[0] if row else None
+
+    lvl2_id = None
+    if lvl1_id:
+        cur.execute("SELECT referrer_id FROM users WHERE id = ?", (lvl1_id,))
+        row2 = cur.fetchone()
+        if row2:
+            lvl2_id = row2[0]
+
+    conn.close()
+    return lvl1_id, lvl2_id
+
+
+def save_progress(user_db_id: int, course: str, module_index: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO progress (user_id, course, module_index)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, course) DO UPDATE SET module_index = excluded.module_index
+        """,
+        (user_db_id, course, module_index),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_progress(user_db_id: int, course: str) -> int:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT module_index FROM progress WHERE user_id = ? AND course = ?",
+        (user_db_id, course),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else -1
+
+
+def count_referrals(user_db_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    # 1 линия
+    cur.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_db_id,))
+    lvl1 = cur.fetchone()[0]
+    # 2 линия
+    cur.execute(
+        """
+        SELECT COUNT(*)
+        FROM users
+        WHERE referrer_id IN (
+            SELECT id FROM users WHERE referrer_id = ?
+        )
+        """,
+        (user_db_id,),
+    )
+    lvl2 = cur.fetchone()[0]
+    conn.close()
+    return lvl1, lvl2
+
+
+# ---------------------------------------------------------------------------
+# АНТИСПАМ
+# ---------------------------------------------------------------------------
+
+user_last_action = {}
+
+
+def is_spam(user_id: int) -> bool:
+    now = datetime.utcnow()
+    last = user_last_action.get(user_id)
+    user_last_action[user_id] = now
+    if not last:
+        return False
+    return (now - last) < timedelta(seconds=ANTISPAM_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# ТРАНЗАКЦИИ TRONGRID
+# ---------------------------------------------------------------------------
+
+
+async def fetch_trc20_transactions() -> list:
+    """
+    Получаем последние TRC20-транзакции по нашему кошельку.
+    """
+    headers = {"TRON-PRO-API-KEY": TRONGRID_API_KEY} if TRONGRID_API_KEY else {}
+    url = f"https://api.trongrid.io/v1/accounts/{WALLET_ADDRESS}/transactions/trc20"
+    params = {
+        "limit": 50,
+        "contract_address": USDT_CONTRACT,
+        "only_confirmed": "true",
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(url, params=params, timeout=20) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.error("TronGrid error %s: %s", resp.status, text)
+                return []
+            data = await resp.json()
+            return data.get("data", [])
+
+
+async def find_payment_for_purchase(amount: Decimal, created_at: datetime) -> str | None:
+    """
+    Ищем транзакцию по сумме (с хвостиком) и времени создания.
+    Возвращаем tx_id или None.
+    """
+    txs = await fetch_trc20_transactions()
+    if not txs:
+        return None
+
+    for tx in txs:
+        try:
+            to_addr = tx.get("to")
+            if to_addr != WALLET_ADDRESS:
+                continue
+
+            token_info = tx.get("token_info") or {}
+            decimals = int(token_info.get("decimals", 6))
+            raw_value = Decimal(tx.get("value", "0"))
+            value = raw_value / (Decimal(10) ** decimals)
+
+            # чуть-чуть допускаем плавающую точку
+            if abs(value - amount) > Decimal("0.0005"):
+                continue
+
+            ts_ms = tx.get("block_timestamp")
+            tx_time = datetime.utcfromtimestamp(ts_ms / 1000.0)
+
+            # проверяем, что платёж не сильно старше заявки (например, не старше 24 часов)
+            if tx_time + timedelta(hours=24) < created_at:
+                continue
+
+            tx_id = tx.get("transaction_id")
+            return tx_id
+        except Exception as e:
+            logger.exception("Error while parsing Tron tx: %s", e)
+            continue
+
+    return None
+
+
+async def process_successful_payment(purchase_row):
+    """
+    purchase_row: (id, user_id, product_code, amount, status, created_at, tx_id)
+    Начисляет доступ, продление, партнёрку.
+    """
+    purchase_id, user_db_id, product_code, amount_f, status, created_at_str, _ = purchase_row
+    amount = Decimal(str(amount_f))
+
+    # Помечаем как оплачено (tx_id уже определили до вызова)
+    # tx_id мы передадим из проверяющей функции
+    # Здесь только логика начислений
+
+    # Если это пакет за 100$
+    if product_code == "package":
+        # открываем полный доступ
+        set_full_access(user_db_id, True)
+        # продлеваем сигналы на месяц
+        extend_signals(user_db_id, days=30)
+
+        # реферальные начисления считаем от базовой цены (100$), а не от суммы с хвостом
+        base = PRICE_PACKAGE
+        lvl1_id, lvl2_id = get_referrer_chain(user_db_id)
+        lvl1_bonus = (base * LEVEL1_PERCENT).quantize(Decimal("0.01"))
+        lvl2_bonus = (base * LEVEL2_PERCENT).quantize(Decimal("0.01"))
+
+        # 1 уровень
+        if lvl1_id:
+            add_balance(lvl1_id, lvl1_bonus)
+            # уведомление
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users WHERE id = ?", (lvl1_id,))
+            r = cur.fetchone()
+            conn.close()
+            if r:
+                try:
+                    await bot.send_message(
+                        r[0],
+                        f"💰 <b>Начислено {lvl1_bonus}$</b> за личную рекомендацию.\n"
+                        f"Твой партнёр совершил покупку полного доступа.",
+                    )
+                except Exception:
+                    pass
+
+        # 2 уровень
+        if lvl2_id:
+            add_balance(lvl2_id, lvl2_bonus)
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users WHERE id = ?", (lvl2_id,))
+            r = cur.fetchone()
+            conn.close()
+            if r:
+                try:
+                    await bot.send_message(
+                        r[0],
+                        f"💸 <b>Начислено {lvl2_bonus}$</b> со второго уровня.\n"
+                        f"Партнёр второй линии купил полный доступ.",
+                    )
+                except Exception:
+                    pass
+
+        # уведомляем покупателя
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE id = ?", (user_db_id,))
+        r = cur.fetchone()
+        conn.close()
+        if r:
+            tg_id = r[0]
+            try:
+                await bot.send_message(
+                    tg_id,
+                    "✅ <b>Оплата подтверждена!</b>\n\n"
+                    "Полный доступ к обучению, партнёрке и сигналам (на 1 месяц) открыт.\n"
+                    f"Сигналы приходят в канале: {SIGNALS_CHANNEL_LINK}",
+                )
+            except Exception:
+                pass
+
+    elif product_code == "renewal":
+        # только продление сигналов, без партнёрки
+        extend_signals(user_db_id, days=30)
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE id = ?", (user_db_id,))
+        r = cur.fetchone()
+        conn.close()
+        if r:
+            tg_id = r[0]
+            try:
+                await bot.send_message(
+                    tg_id,
+                    "✅ <b>Продление сигналов оплачено!</b>\n\n"
+                    "Подписка на сигнальный канал продлена ещё на 30 дней.",
+                )
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# КУРСЫ (8 блоков трейдинг, 6 блоков трафик)
+# ---------------------------------------------------------------------------
+
+# Для экономии места делаю по одному большому тексту на модуль.
+# При желании потом расширишь каждый блок на несколько уроков.
+
+COURSE_CRYPTO = [
+    (
+        "1️⃣ Модуль 1. Базовая подготовка и безопасность",
+        "🧠 <b>Модуль 1. Базовая подготовка и безопасность</b>\n\n"
+        "В этом модуле мы не лезем в сложные стратегии. Твоя задача — понять, что ты делаешь и где именно "
+        "находятся основные риски.\n\n"
+        "Что разберём:\n"
+        "• чем трейдинг отличается от казино и инвестиций\n"
+        "• какие типы бирж и аккаунтов бывают\n"
+        "• базовые настройки безопасности (2FA, пароли, антифишинг-коды)\n"
+        "• почему нельзя торговать с «последних денег»\n\n"
+        "Задача модуля — сформировать у тебя здоровое отношение к рынку: без иллюзий «кнопки бабло», "
+        "но и без драматизации.\n\n"
+        "<b>Домашка:</b> подключи двухфакторную аутентификацию на бирже, сделай отдельную почту под трейдинг "
+        "и пропиши для себя правило: какую сумму ты готов потерять без боли (это и есть твой риск-капитал).",
+    ),
+    (
+        "2️⃣ Модуль 2. Как устроен рынок и графики",
+        "📊 <b>Модуль 2. Как устроен рынок и графики</b>\n\n"
+        "Здесь мы разбираем, что вообще происходит на графике и откуда берутся свечи.\n\n"
+        "Разберём:\n"
+        "• что такое ордера, стакан, ликвидность\n"
+        "• виды графиков: свечные, линейные, Heikin Ashi\n"
+        "• таймфреймы и почему «торговать всё подряд» — путь в никуда\n"
+        "• кто такие маркетмейкеры и почему они двигают рынок\n\n"
+        "После модуля ты перестанешь видеть в графике «хаос» — появится ощущение структуры.\n\n"
+        "<b>Домашка:</b> выбери одну биржу и один инструмент (например BTC/USDT). "
+        "Понаблюдай за ним на разных таймфреймах (M5, M15, H1, H4), отметь, как меняется скорость движения.",
+    ),
+    (
+        "3️⃣ Модуль 3. Психология трейдинга и типичные ошибки",
+        "🧩 <b>Модуль 3. Психология трейдинга</b>\n\n"
+        "90% людей сливают депозит не потому, что не знают стратегий, а потому, что нарушают свои же правила.\n\n"
+        "Разберём:\n"
+        "• FOMO (страх упустить движение) и как он толкает входить в конце тренда\n"
+        "• revenge-trading — попытка «отбиться» после минуса\n"
+        "• эффект серии — почему после 3 плюсов подряд хочется «нажать побольше»\n"
+        "• как сформировать рабочий дневник трейдера\n\n"
+        "Ты поймёшь, что эмоции — это не слабость, а сигнал. Важно научиться их распознавать и "
+        "останавливаться, когда тебя «ведёт».\n\n"
+        "<b>Домашка:</b> заведите табличку/док, куда будешь записывать каждую сделку: дата, инструмент, вход, выход, "
+        "стоп, риск, эмоции до/после сделки. Это база для роста.",
+    ),
+    (
+        "4️⃣ Модуль 4. Риск-менеджмент и размер позиции",
+        "⚖️ <b>Модуль 4. Риск-менеджмент</b>\n\n"
+        "Если ты не контролируешь риск — рынок сделает это за тебя, но жестко.\n\n"
+        "Разберём:\n"
+        "• правило 1–2% риска на сделку\n"
+        "• как считать объём позиции под заданный стоп\n"
+        "• почему усреднение против тренда чаще всего ведёт к сливу\n"
+        "• как пережить серию убыточных сделок без уничтожения депозита\n\n"
+        "Мы переведём риск из «страха потерять» в чёткую формулу.\n\n"
+        "<b>Домашка:</b> возьми свой текущий депозит и посчитай, какой максимальный размер позиции у тебя должен быть "
+        "при стопе 3%, 5% и 8% при риске 1% от депозита.",
+    ),
+    (
+        "5️⃣ Модуль 5. Базовая трендовая стратегия",
+        "📈 <b>Модуль 5. Базовая трендовая стратегия</b>\n\n"
+        "Вместо ловли разворотов мы работаем по тренду — это проще и статистически выгоднее.\n\n"
+        "Разберём:\n"
+        "• как определять тренд по структуре максимумов и минимумов\n"
+        "• что такое импульс и коррекция\n"
+        "• базовая логика входа «по тренду после отката»\n"
+        "• куда ставить стоп и как фиксировать прибыль частями\n\n"
+        "<b>Домашка:</b> найди на графике 10 ситуаций, где тренд уже очевидно сформирован, и отметь, "
+        "где логично было бы войти по тренду после коррекции. Это тренировка зрения.",
+    ),
+    (
+        "6️⃣ Модуль 6. Работа с уровнями и зонами ликвидности",
+        "🧱 <b>Модуль 6. Уровни и ликвидность</b>\n\n"
+        "Здесь мы добавляем к тренду уровни, от которых цена часто реагирует.\n\n"
+        "Разберём:\n"
+        "• как отмечать значимые уровни на старших таймфреймах\n"
+        "• почему «каждый пик — уровень» не работает\n"
+        "• что такое зоны стопов и как крупные игроки их используют\n"
+        "• как совмещать уровни с трендом и получать более сильные точки входа\n\n"
+        "<b>Домашка:</b> на своём основном инструменте отметь 5–7 ключевых зон, где цена сильно реагировала "
+        "за последние месяцы, и посмотри, как там шла борьба покупателей и продавцов.",
+    ),
+    (
+        "7️⃣ Модуль 7. Пошаговый план торговли",
+        "📋 <b>Модуль 7. План торговли</b>\n\n"
+        "Без плана ты всегда будешь торговать эмоциями. Здесь собираем систему воедино.\n\n"
+        "Разберём:\n"
+        "• чек-лист перед входом в сделку\n"
+        "• пример готового плана: от поиска инструмента до выхода из позиции\n"
+        "• как встроить в план риск-менеджмент и лимит по убытку в день\n"
+        "• как проверять свои сделки раз в неделю и корректировать стратегию\n\n"
+        "<b>Домашка:</b> напиши свой чек-лист на 5–10 пунктов, который ты будешь прогонять перед каждой сделкой. "
+        "И прикрепи его куда-нибудь на видное место.",
+    ),
+    (
+        "8️⃣ Модуль 8. Практика и переход на реальные деньги",
+        "🚀 <b>Модуль 8. Практика и переход на реальные деньги</b>\n\n"
+        "Финальный модуль — про то, как аккуратно перейти от теории и демо к реальным деньгам.\n\n"
+        "Разберём:\n"
+        "• как тестировать стратегию на истории и в демо-режиме\n"
+        "• как переходить на реальные деньги маленькими шагами\n"
+        "• как фиксировать результат не только в долларах, но и в качестве исполнения плана\n"
+        "• что делать, если после перехода на реал всё «ломается» психологически\n\n"
+        "<b>Домашка:</b> составь план перехода на реал на 1–3 месяца: "
+        "какой объём, сколько сделок, какие критерии «я готов увеличить размер позиции».",
+    ),
+]
+
+COURSE_TRAFFIC = [
+    (
+        "1️⃣ Модуль 1. Основы арбитража и воронки",
+        "🚀 <b>Модуль 1. Основы арбитража и воронки</b>\n\n"
+        "Разберём, как вообще устроен арбитраж и перелив трафика в деньгах.\n\n"
+        "• что такое оффер, KPI и payout\n"
+        "• какие вертикали существуют (финансы, нутра, гейминг, сабскрипшены и т.д.)\n"
+        "• чем отличается холодный трафик от тёплого\n"
+        "• зачем тебе вообще Telegram как финальная точка воронки\n\n"
+        "<b>Домашка:</b> выпиши 3–5 ниш, которые тебе интересны, и найди по ним офферы "
+        "в открытых партнёрках (без углубления, просто чтобы увидеть, как это выглядит.",
+    ),
+    (
+        "2️⃣ Модуль 2. Источники трафика и выбор стартовой площадки",
+        "🌐 <b>Модуль 2. Источники трафика</b>\n\n"
+        "Ты не обязан запускаться во всех источниках. На старте достаточно выбрать 1–2.\n\n"
+        "Разберём:\n"
+        "• TikTok, Reels, Shorts как источник бесплатного/дешёвого трафика\n"
+        "• плюсы и минусы платного трафика (Facebook, TikTok Ads, myTarget и т.д.)\n"
+        "• как выбрать источник под свой бюджет и уровень опыта\n"
+        "• примеры рабочих связок «ролики → бот → оффер/подписка»\n\n"
+        "<b>Домашка:</b> выбери один основной источник трафика и один запасной. "
+        "Запиши, почему именно они и какие ограничения там есть (модерация, креативы и т.п.).",
+    ),
+    (
+        "3️⃣ Модуль 3. Контент и креативы под перелив в бот",
+        "🎨 <b>Модуль 3. Контент и креативы</b>\n\n"
+        "Тебе не нужно изобретать шедевры. Важно делать понятный, повторяемый контент.\n\n"
+        "Разберём:\n"
+        "• как делать ролики, которые приводят трафик в Telegram, а не просто набирают просмотры\n"
+        "• структура ролика: зацепка → ценность → переход в бот\n"
+        "• простые форматы для ниши крипты/дохода: разбор сделок, мини-обучение, кейсы, истории\n"
+        "• как адаптировать чужие идеи легально (без копипаста)\n\n"
+        "<b>Домашка:</b> придумай 10 тем для коротких роликов, которые логично ведут в твой бот. "
+        "Напиши к ним примерный сценарий на 3–5 строк.",
+    ),
+    (
+        "4️⃣ Модуль 4. Трафик → Бот → Монетизация",
+        "🔁 <b>Модуль 4. Воронка: трафик → бот → деньги</b>\n\n"
+        "Разберём связку на примере нашего бота.\n\n"
+        "• точка входа: ролик/объявление → ссылка на бота\n"
+        "• приветственное сообщение и первый экран (как ты видел в этом проекте)\n"
+        "• куда вести человека дальше: обучение, заработок, профиль\n"
+        "• где происходит монетизация: продажа полного доступа за 100$, партнёрка, доп. продукты\n\n"
+        "<b>Домашка:</b> нарисуй схему своей воронки: из какого источника идёт трафик, "
+        "какие экраны он видит в боте и где именно ты зарабатываешь.",
+    ),
+    (
+        "5️⃣ Модуль 5. Аналитика и оптимизация связок",
+        "📊 <b>Модуль 5. Аналитика</b>\n\n"
+        "Без цифр ты не понимаешь, работает ли вообще твоя система.\n\n"
+        "Разберём:\n"
+        "• какие ключевые метрики отслеживать (CTR, конверсии, стоимость лида/покупки)\n"
+        "• как считать, сколько ты зарабатываешь с одного подписчика в боте\n"
+        "• как принимать решения: масштабировать связку или искать новую\n"
+        "• простые таблицы/дашборды для старта\n\n"
+        "<b>Домашка:</b> создай таблицу, где будешь фиксировать: сколько людей пришло, откуда, "
+        "сколько оплатило полный доступ и какой доход с них получился.",
+    ),
+    (
+        "6️⃣ Модуль 6. Масштабирование и выстраивание партнёрской сети",
+        "🏗 <b>Модуль 6. Масштабирование</b>\n\n"
+        "Когда базовая связка работает, задача — аккуратно масштабировать.\n\n"
+        "Разберём:\n"
+        "• как повышать объёмы трафика, не убивая конверсии\n"
+        "• как подключать других людей к переливу (по партнёрке)\n"
+        "• как обучать партнёров, чтобы они не сливали трафик впустую\n"
+        "• как не перегореть самому и выстроить рабочий ритм\n\n"
+        "<b>Домашка:</b> пропиши план масштабирования на 1–3 месяца: какие источники трафика подключаешь, "
+        "какие метрики считаешь «нормой» и в каком моменте перерастаешь текущую модель.",
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# КЛАВИАТУРЫ
+# ---------------------------------------------------------------------------
+
+
+def main_reply_kb():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(
+        KeyboardButton("🧠 Обучение"),
+        KeyboardButton("💸 Заработок"),
+        KeyboardButton("👤 Профиль"),
+    )
+    return kb
+
+
+def start_inline_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("ℹ️ Как это работает", callback_data="home_how"))
+    return kb
+
+
+def edu_main_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📈 Курс по трейдингу", callback_data="edu_crypto"))
+    kb.add(InlineKeyboardButton("🚀 Курс по трафику", callback_data="edu_traffic"))
+    kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
+    return kb
+
+
+def back_to_edu_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+    return kb
+
+
+def earn_main_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📎 Подробнее про партнёрку", callback_data="earn_more"))
+    kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
+    kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
+    kb.add(InlineKeyboardButton("📡 Канал с сигналами", callback_data="signals_channel"))
+    kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
+    kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
+    return kb
+
+
+def profile_kb(has_access: bool, has_signals: bool):
+    kb = InlineKeyboardMarkup()
+    if has_access:
+        kb.add(InlineKeyboardButton("🔗 Моя реферальная ссылка", callback_data="my_ref"))
+        if not has_signals:
+            kb.add(InlineKeyboardButton("📥 Оплатить продление сигналов", callback_data="renew_signals"))
+    else:
+        kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
+    kb.add(InlineKeyboardButton("🧠 Перейти к обучению", callback_data="home_edu"))
+    kb.add(InlineKeyboardButton("ℹ️ FAQ", callback_data="faq"))
+    kb.add(InlineKeyboardButton("💬 Поддержка", callback_data="support"))
+    kb.add(InlineKeyboardButton("⬅️ В начало", callback_data="back_home"))
+    return kb
+
+
+def payment_kb(purchase_id: int, back_cb: str):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✅ Проверить оплату", callback_data=f"check_pay:{purchase_id}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data=back_cb))
+    return kb
+
+
+def crypto_modules_kb():
+    kb = InlineKeyboardMarkup()
+    for idx, (title, _) in enumerate(COURSE_CRYPTO):
+        kb.add(InlineKeyboardButton(title, callback_data=f"crypto_mod:{idx}"))
+    kb.add(InlineKeyboardButton("🔗 Канал с обучением по трейдингу", url=TRADING_EDU_CHANNEL))
+    kb.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+    return kb
+
+
+def traffic_modules_kb():
+    kb = InlineKeyboardMarkup()
+    for idx, (title, _) in enumerate(COURSE_TRAFFIC):
+        kb.add(InlineKeyboardButton(title, callback_data=f"traffic_mod:{idx}"))
+    kb.add(InlineKeyboardButton("🔗 Канал с обучением по трафику", url=TRAFFIC_EDU_CHANNEL))
+    kb.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+    return kb
+
+
+# ---------------------------------------------------------------------------
+# /START + РЕФЕРАЛКА
+# ---------------------------------------------------------------------------
+
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+
+    # Парсим реферальный код: /start ref_123456789
+    args = message.get_args()
+    referrer_db_id = None
+    if args and args.startswith("ref_"):
+        try:
+            ref_tg_id = int(args.split("_", 1)[1])
+            if ref_tg_id != message.from_user.id:
+                conn = db_connect()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM users WHERE user_id = ?", (ref_tg_id,))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    referrer_db_id = row[0]
+        except Exception:
+            pass
+
+    user_db_id = get_or_create_user(message, referrer_db_id)
 
     text = (
-        f"👤 *Профиль*\n\n"
-        f"Статус: {status}\n"
-        f"До: {end_date}\n"
-        f"Осталось дней: {days_left}\n"
-        f"Оплата: {tx_amount} USDT\n"
-        f"Когда: {tx_time}"
-    )
-    await message.answer(text, parse_mode="Markdown")
-
-
-@dp.message_handler(lambda m: m.text == "📈 Получить сигналы")
-async def buy(message: types.Message):
-    unique_tail = random.randint(1, 999)
-    unique_price = float(f"{PRICE_USDT}.{unique_tail:03d}")
-    user_unique_price[message.from_user.id] = unique_price
-
-    kb = ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[
-            [KeyboardButton("🔄 Проверить оплату")],
-            [KeyboardButton("⬅️ В главное меню")],
-        ],
+        "👋 Привет! Здесь команда, которая уже много лет живёт рынком и онлайном 📈💻\n\n"
+    "Мы не продаём сказки и \"волшебные кнопки\" — делимся только тем, что сами каждый день "
+    "используем в работе и что помогает зарабатывать на дистанции ✅"
     )
 
-    await message.answer(
-        f"Отправь *РОВНО* `{unique_price}` USDT(TRC20)\nНа адрес:\n`{WALLET_ADDRESS}`",
-        reply_markup=kb,
-        parse_mode="Markdown"
+    await message.answer(text, reply_markup=main_reply_kb())
+    await message.answer("Общая информация 👇", reply_markup=start_inline_kb())
+
+
+
+# ---------------------------------------------------------------------------
+# ОБЩИЕ ХЭНДЛЕРЫ ГЛАВНЫХ КНОПОК
+# ---------------------------------------------------------------------------
+
+
+@dp.message_handler(lambda m: m.text == "🧠 Обучение")
+async def msg_edu(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await send_edu_main(message)
+
+
+@dp.message_handler(lambda m: m.text == "💸 Заработок")
+async def msg_earn(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await send_earn_main(message)
+
+
+@dp.message_handler(lambda m: m.text == "👤 Профиль")
+async def msg_profile(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await send_profile(message)
+
+
+# ---------------------------------------------------------------------------
+# CALLBACK: ГЛАВНОЕ МЕНЮ (ИНЛАЙН)
+# ---------------------------------------------------------------------------
+
+
+@dp.callback_query_handler(lambda c: c.data == "home_edu")
+async def cb_home_edu(call: CallbackQuery):
+    await send_edu_main(call.message, edit=True)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "home_earn")
+async def cb_home_earn(call: CallbackQuery):
+    await send_earn_main(call.message, edit=True)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "home_profile")
+async def cb_home_profile(call: CallbackQuery):
+    await send_profile(call.message, edit=True)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "home_how")
+async def cb_home_how(call: CallbackQuery):
+    text = (
+        "ℹ️ <b>Как всё устроено</b>\n\n"
+"📦 <b>За $100 ты получаешь:</b>\n"
+"• Обучение по трейдингу и трафику (14 модулей)\n"
+"• 1 месяц доступа в закрытый канал с сигналами\n"
+"• Партнёрскую программу 50% + 10%\n"
+"• Личный кабинет с рефералкой и статистикой\n\n"
+"Обучение и партнёрка — <b>навсегда</b>, сигналы — по подписке ($50 в месяц).\n\n"
+"🤝 <b>Партнёрка:</b> 50% с 1-го уровня и 10% со 2-го.\n\n"
+"⚠️ <b>Важно:</b> крипта и трейдинг — это риск, гарантий дохода нет.\n"
+"Все решения по сделкам ты принимаешь сам.\n\n"
+
     )
+    try:
+        await call.message.edit_text(text, reply_markup=start_inline_kb())
+    except Exception:
+        await call.message.answer(text, reply_markup=start_inline_kb())
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "back_home")
+async def cb_back_home(call: CallbackQuery):
+    # просто снова покажем стартовое меню
+    fake_msg = call.message
+    fake_msg.from_user = call.from_user  # чтобы в send_* использовать tg_id
+    await cmd_start(fake_msg)
+    await call.answer()
 
 
-@dp.message_handler(lambda m: m.text == "🔄 Проверить оплату")
-async def check_payment(message: types.Message):
-    await message.answer("⏳ Проверяю...")
+# ---------------------------------------------------------------------------
+# ОБУЧЕНИЕ
+# ---------------------------------------------------------------------------
 
-    if await check_trx_payment(message.from_user.id):
-        amount = user_unique_price.get(message.from_user.id)
-        save_payment(message.from_user.id, amount, amount)
-        user_unique_price.pop(message.from_user.id, None)
 
+async def send_edu_main(message: types.Message, edit: bool = False):
+    text = (
+        "🧠 <b>Обучение внутри экосистемы</b>\n\n"
+        "Ты получаешь два направления:\n\n"
+        "1️⃣ <b>Крипто-трейдинг</b> — 8 модулей от базовой теории до системного подхода и риск-менеджмента.\n"
+        "2️⃣ <b>Перелив трафика и работа с офферами</b> — 6 модулей по источникам трафика, креативам и связкам.\n\n"
+        "3️⃣ <b>Работа с сигналами</b> — отдельный блок про то, как правильно пользоваться нашим "
+        "сигнальным каналом: какой объём ставить, где ставить стоп, как не сливать депозит на эмоциях.\n\n"
+        "Часть материалов — выжимка из платных программ, которые мы покупали у топовых трейдеров и "
+        "арбитражников суммарно более чем на <b>$15 000</b>.\n\n"
+        "Начни с того, что тебе ближе 👇"
+    )
+    kb = edu_main_kb()
+    if edit:
         try:
-            invite = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
-            await message.answer(f"✔ Оплата найдена!\nВход: {invite.invite_link}")
-        except:
-            await message.answer("Оплачено, но не могу создать ссылку!")
+            await message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=kb)
 
+
+@dp.callback_query_handler(lambda c: c.data == "edu_structure")
+async def cb_edu_structure(call: CallbackQuery):
+    # Структура трейдинга
+    lines = ["📚 <b>Структура курса по трейдингу (8 модулей)</b>\n"]
+    for title, _ in COURSE_CRYPTO:
+        lines.append(f"• {title}")
+    lines.append("\nНажми кнопку ниже, чтобы перейти к курсу.")
+    text_crypto = "\n".join(lines)
+
+    # Структура трафика 
+    lines2 = ["📚 <b>Структура курса по трафику (6 модулей)</b>\n"]
+    for title, _ in COURSE_TRAFFIC:
+        lines2.append(f"• {title}")
+    lines2.append("\nНажми кнопку ниже, чтобы перейти к курсу.")
+    text_traffic = "\n".join(lines2)
+
+    kb_crypto = InlineKeyboardMarkup()
+    kb_crypto.add(InlineKeyboardButton("📈 Перейти к курсу по трейдингу", callback_data="edu_crypto"))
+    kb_crypto.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+
+    kb_traffic = InlineKeyboardMarkup()
+    kb_traffic.add(InlineKeyboardButton("🚀 Перейти к курсу по трафику", callback_data="edu_traffic"))
+    kb_traffic.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+
+    await call.message.answer(text_crypto, reply_markup=kb_crypto)
+    await call.message.answer(text_traffic, reply_markup=kb_traffic)
+    await call.answer()
+
+
+def _get_user_db_id(tg_id: int) -> int | None:
+    row = get_user_by_tg(tg_id)
+    return row[0] if row else None
+
+
+@dp.callback_query_handler(lambda c: c.data == "edu_crypto")
+async def cb_edu_crypto(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        get_or_create_user(call.message)
+        user_row = get_user_by_tg(call.from_user.id)
+    user_db_id = user_row[0]
+    full = bool(user_row[7])
+
+    if not full:
+        text = (
+            "📈 <b>Курс по трейдингу</b>\n\n"
+            "Курс доступен после покупки полного доступа за <b>$100</b>.\n\n"
+            "Ты получаешь 8 модулей с системным подходом к крипто-торговле, плюс доступ к трафику, "
+            "сигналам и партнёрке.\n\n"
+            "Чтобы открыть курс — оформи полный доступ."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("📚 Посмотреть структуру", callback_data="edu_structure"))
+        kb.add(InlineKeyboardButton("💳 Открыть полный доступ", callback_data="open_access"))
+        kb.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, reply_markup=kb)
     else:
-        await message.answer("❌ Платёж не найден.")
+        text = "📈 <b>Курс по трейдингу</b>\n\n✅ У тебя открыт полный доступ. Выбери модуль 👇"
+        try:
+            await call.message.edit_text(text, reply_markup=crypto_modules_kb())
+        except Exception:
+            await call.message.answer(text, reply_markup=crypto_modules_kb())
+    await call.answer()
 
-@dp.message_handler(commands=['admin'])
-async def admin_panel(message: types.Message):
-    if not is_admin(message): return
-    await message.answer("Админ-панель:", reply_markup=admin_keyboard())
+
+@dp.callback_query_handler(lambda c: c.data == "edu_traffic")
+async def cb_edu_traffic(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        get_or_create_user(call.message)
+        user_row = get_user_by_tg(call.from_user.id)
+    user_db_id = user_row[0]
+    full = bool(user_row[7])
+
+    if not full:
+        text = (
+            "🚀 <b>Курс по переливу трафика</b>\n\n"
+            "Доступ к курсу открывается после покупки полного доступа за <b>$100</b>.\n\n"
+            "Внутри 6 модулей по источникам трафика, связкам, креативам и аналитике.\n\n"
+            "Чтобы открыть курс — оформи полный доступ."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("📚 Посмотреть структуру", callback_data="edu_structure"))
+        kb.add(InlineKeyboardButton("💳 Открыть полный доступ", callback_data="open_access"))
+        kb.add(InlineKeyboardButton("⬅️ Назад к обучению", callback_data="home_edu"))
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, reply_markup=kb)
+    else:
+        text = "🚀 <b>Курс по трафику</b>\n\n✅ Курс доступен. Выбери модуль 👇"
+        try:
+            await call.message.edit_text(text, reply_markup=traffic_modules_kb())
+        except Exception:
+            await call.message.answer(text, reply_markup=traffic_modules_kb())
+    await call.answer()
 
 
-@dp.message_handler(lambda m: m.text == "📤 Экспорт CSV")
-async def export_csv(message: types.Message):
-    if not is_admin(message): return
+@dp.callback_query_handler(lambda c: c.data.startswith("crypto_mod:"))
+async def cb_crypto_mod(call: CallbackQuery):
+    idx = int(call.data.split(":")[1])
+    if idx < 0 or idx >= len(COURSE_CRYPTO):
+        await call.answer("Модуль не найден", show_alert=True)
+        return
 
-    cursor.execute("SELECT * FROM subscriptions")
-    rows = cursor.fetchall()
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row or not user_row[7]:
+        await call.answer("Курс доступен только после покупки полного доступа.", show_alert=True)
+        return
+
+    user_db_id = user_row[0]
+    save_progress(user_db_id, "crypto", idx)
+
+    title, text_body = COURSE_CRYPTO[idx]
+    text = f"{text_body}\n\nПрогресс: модуль {idx+1} из {len(COURSE_CRYPTO)}."
+    kb = crypto_modules_kb()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("traffic_mod:"))
+async def cb_traffic_mod(call: CallbackQuery):
+    idx = int(call.data.split(":")[1])
+    if idx < 0 or idx >= len(COURSE_TRAFFIC):
+        await call.answer("Модуль не найден", show_alert=True)
+        return
+
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row or not user_row[7]:
+        await call.answer("Курс доступен только после покупки полного доступа.", show_alert=True)
+        return
+
+    user_db_id = user_row[0]
+    save_progress(user_db_id, "traffic", idx)
+
+    title, text_body = COURSE_TRAFFIC[idx]
+    text = f"{text_body}\n\nПрогресс: модуль {idx+1} из {len(COURSE_TRAFFIC)}."
+    kb = traffic_modules_kb()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# ЗАРАБОТОК / ПАРТНЁРКА
+# ---------------------------------------------------------------------------
+
+
+async def send_earn_main(message: types.Message, edit: bool = False):
+    text = (
+        "💸 <b>Как здесь зарабатывать</b>\n\n"
+        "1️⃣ Ты покупаешь полный доступ за <b>$100</b>: обучение + партнёрка + сигналы на месяц.\n"
+        "2️⃣ Получаешь личную реферальную ссылку.\n"
+        "3️⃣ Приглашаешь людей на полный доступ.\n"
+        "4️⃣ Получаешь:\n"
+        "   • <b>50%</b> с 1-го уровня\n"
+        "   • <b>10%</b> со 2-го уровня\n\n"
+        "Всё прозрачно: вся статистика видна в твоём профиле.\n"
+        "Это не «кнопка бабло», а инструмент. Результат зависит от твоей активности и того, "
+        "как ты пользуешься обучением."
+    )
+    kb = earn_main_kb()
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data == "earn_more")
+async def cb_earn_more(call: CallbackQuery):
+    text = (
+        "🤝 <b>Партнёрская программа 50% + 10%</b>\n\n"
+        "• Реферальная ссылка открывается после покупки полного доступа.\n"
+        "• Ты получаешь:\n"
+        "  • 50% с покупки полного доступа людьми 1-го уровня\n"
+        "  • 10% с покупки полного доступа людьми 2-го уровня\n\n"
+        "Все начисления и структура видны в твоём профиле.\n"
+        "Вознаграждение идёт именно с <b>первой покупки полного доступа</b> человеком."
+    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
+    kb.add(InlineKeyboardButton("💳 Открыть полный доступ", callback_data="open_access"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "earn_stats")
+async def cb_earn_stats(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        await call.answer("Сначала запусти бота через /start.", show_alert=True)
+        return
+
+    user_db_id, _, username, first_name, _, balance, total_earned, full_access = user_row
+    lvl1, lvl2 = count_referrals(user_db_id)
+    total_refs = lvl1 + lvl2
+
+    text = (
+        "📊 <b>Твоя партнёрская статистика</b>\n\n"
+        f"Имя: <b>{first_name}</b>\n"
+        f"Логин: @{username if username else '—'}\n\n"
+        f"Партнёров 1 уровня: <b>{lvl1}</b>\n"
+        f"Партнёров 2 уровня: <b>{lvl2}</b>\n"
+        f"Всего приглашено: <b>{total_refs}</b>\n\n"
+        f"Баланс к выводу: <b>{Decimal(str(balance)).quantize(Decimal('0.01'))}$</b>\n"
+        f"Всего заработано: <b>{Decimal(str(total_earned)).quantize(Decimal('0.01'))}$</b>\n\n"
+        "Статус доступа: <b>{}</b>".format("Полный доступ есть ✅" if full_access else "Полный доступ не оплачен ❌")
+    )
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔗 Моя реферальная ссылка", callback_data="my_ref"))
+    kb.add(InlineKeyboardButton("🏆 Топ партнёров", callback_data="earn_top"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "earn_top")
+async def cb_earn_top(call: CallbackQuery):
+    # Топ по количеству рефералов 1 уровня
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT u.username, u.first_name, COUNT(r.id) as cnt
+        FROM users u
+        LEFT JOIN users r ON r.referrer_id = u.id
+        GROUP BY u.id
+        HAVING cnt > 0
+        ORDER BY cnt DESC
+        LIMIT 10
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
 
     if not rows:
-        return await message.answer("Нет данных.")
+        text = "🏆 Пока ещё нет партнёров в топе. Стань первым!"
+    else:
+        lines = ["🏆 <b>Топ партнёров по количеству приглашённых</b>\n"]
+        for i, (username, first_name, cnt) in enumerate(rows, start=1):
+            name = f"@{username}" if username else first_name or "Без имени"
+            lines.append(f"{i}. {name} — {cnt} приглашённых")
+        text = "\n".join(lines)
 
-    filename = "subscriptions_export.csv"
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["user_id", "unique_price", "paid", "start", "end", "amount", "time"])
-        for row in rows:
-            writer.writerow(row)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📊 Моя статистика", callback_data="earn_stats"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
 
-    with open(filename, "rb") as f:
-        await message.answer_document(f, caption="Экспорт подписчиков")
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
 
 
-# ==========================
-# ФОНОВЫЕ ЗАДАЧИ
-# ==========================
+@dp.callback_query_handler(lambda c: c.data == "my_ref")
+async def cb_my_ref(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        await call.answer("Сначала запусти бота через /start.", show_alert=True)
+        return
 
-async def periodic_tasks():
-    await asyncio.sleep(10)
+    user_db_id, user_tg_id, username, first_name, _, _, _, full_access = user_row
+
+    if not full_access:
+        text = (
+            "🔗 <b>Реферальная ссылка</b>\n\n"
+            "Чтобы получить реферальную ссылку, сначала открой полный доступ за <b>$100</b>."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💳 Открыть полный доступ", callback_data="open_access"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="home_earn"))
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, reply_markup=kb)
+        await call.answer()
+        return
+
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start=ref_{user_tg_id}"
+
+    text = (
+        "🔗 <b>Твоя реферальная ссылка</b>\n\n"
+        f"<code>{ref_link}</code>\n\n"
+        "Делись ей с людьми, которые хотят:\n"
+        "• разобраться в трейдинге\n"
+        "• научиться переливать трафик\n"
+        "• зарабатывать по партнёрской программе."
+    )
+
+    try:
+        await call.message.edit_text(text)
+    except Exception:
+        await call.message.answer(text)
+    await call.answer()
+ 
+@dp.callback_query_handler(lambda c: c.data == "signals_channel")
+async def cb_signals_channel(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        await call.answer("Сначала запусти бота через /start.", show_alert=True)
+        return
+
+    user_db_id, user_tg_id, username, first_name, _, _, _, full_access = user_row
+    signals_until = get_signals_until(user_db_id)
+
+    # 1) Полного доступа ещё нет → предлагаем купить пакет за $100
+    if not full_access:
+        text = (
+            "📡 <b>Канал с сигналами</b>\n\n"
+            "Доступ к сигналам открывается после покупки полного доступа за <b>$100</b>.\n\n"
+            "Ты получаешь:\n"
+            "• обучение по трейдингу (8 модулей)\n"
+            "• обучение по трафику (6 модулей)\n"
+            "• 1 месяц доступа к сигналам\n"
+            "• партнёрскую программу 50% + 10%\n\n"
+            "Чтобы попасть в канал — оформи полный доступ."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💳 Открыть полный доступ ($100)", callback_data="open_access"))
+        kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, reply_markup=kb)
+        await call.answer()
+        return
+
+    # 2) Полный доступ есть, но подписка на сигналы не активна → просим оплатить продление
+    now = datetime.utcnow()
+    if not signals_until or signals_until < now:
+        text = (
+            "📡 <b>Канал с сигналами</b>\n\n"
+            "Сейчас твоя подписка на сигналы <b>не активна</b>.\n\n"
+            "Чтобы снова получать сигналы, оплати продление за <b>$50</b> на 1 месяц."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("💳 Оплатить продление сигналов ($50)", callback_data="renew_signals"))
+        kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, reply_markup=kb)
+        await call.answer()
+        return
+
+    # 3) Всё оплачено и подписка активна → даём ссылку на канал
+    text = (
+        "📡 <b>Канал с сигналами</b>\n\n"
+        f"Твоя подписка активна до: <b>{signals_until.strftime('%Y-%m-%d')}</b>.\n\n"
+        "Нажми кнопку ниже, чтобы перейти в закрытый канал."
+    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📡 Открыть канал с сигналами", url=SIGNALS_CHANNEL_LINK))
+    kb.add(InlineKeyboardButton("⬅️ Назад к разделу «Заработок»", callback_data="home_earn"))
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+
+# ---------------------------------------------------------------------------
+# ПРОФИЛЬ / ОПЛАТА
+# ---------------------------------------------------------------------------
+
+
+async def send_profile(message: types.Message, edit: bool = False):
+    user_row = get_user_by_tg(message.from_user.id)
+    if not user_row:
+        get_or_create_user(message)
+        user_row = get_user_by_tg(message.from_user.id)
+
+    user_db_id, user_tg_id, username, first_name, _, balance, total_earned, full_access = user_row
+    lvl1, lvl2 = count_referrals(user_db_id)
+    signals_until = get_signals_until(user_db_id)
+
+    # Прогресс обучения
+    crypto_idx = get_progress(user_db_id, "crypto")
+    traffic_idx = get_progress(user_db_id, "traffic")
+    crypto_done = max(0, crypto_idx + 1) if crypto_idx >= 0 else 0
+    traffic_done = max(0, traffic_idx + 1) if traffic_idx >= 0 else 0
+
+    text_lines = [
+        "👤 <b>Твой профиль</b>\n",
+        f"• Ник: @{username if username else '—'}",
+        f"• ID: <code>{user_tg_id}</code>\n",
+        f"• Полный доступ: {'есть ✅' if full_access else 'нет ❌'}",
+    ]
+
+    if signals_until:
+        text_lines.append(f"• Подписка на сигналы активна до: <b>{signals_until.strftime('%Y-%m-%d')}</b>")
+        has_signals = True
+    else:
+        text_lines.append("• Подписка на сигналы: <b>не активна</b>")
+        has_signals = False
+
+    text_lines.extend(
+        [
+            "",
+            f"• Рефералов 1 уровня: <b>{lvl1}</b>",
+            f"• Рефералов 2 уровня: <b>{lvl2}</b>",
+            f"• Баланс к выводу: <b>{Decimal(str(balance)).quantize(Decimal('0.01'))}$</b>",
+            f"• Всего заработано: <b>{Decimal(str(total_earned)).quantize(Decimal('0.01'))}$</b>",
+            "",
+            f"• Прогресс трейдинга: <b>{crypto_done}/{len(COURSE_CRYPTO)} модулей</b>",
+            f"• Прогресс трафика: <b>{traffic_done}/{len(COURSE_TRAFFIC)} модулей</b>",
+        ]
+    )
+
+    text = "\n".join(text_lines)
+    kb = profile_kb(bool(full_access), has_signals)
+
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data == "faq")
+async def cb_faq(call: CallbackQuery):
+    text = (
+        "ℹ️ <b>FAQ</b>\n\n"
+        "❓ <b>Что входит в полный доступ за $100?</b>\n"
+        "• Обучение по трейдингу (8 модулей)\n"
+        "• Обучение по трафику (6 модулей)\n"
+        "• Доступ к сигналам на 1 месяц\n"
+        "• Партнёрская программа 50% + 10%\n"
+        "• Личный кабинет и статистика\n\n"
+        "❓ <b>Можно ли вернуть деньги после оплаты?</b>\n"
+        "Нет. Сразу после оплаты открывается доступ ко всем закрытым материалам и партнёрке, "
+        "поэтому возврат средств не предусмотрен.\n\n"
+        "❓ <b>С чего идёт партнёрское вознаграждение?</b>\n"
+        "Вознаграждение начисляется с покупки полного доступа за $100.\n\n"
+        "❓ <b>Что делать, если оплата прошла, а доступ не открылся?</b>\n"
+        "Напиши в поддержку, укажи сумму, время и хэш транзакции — мы проверим вручную.\n\n"
+        "❓ <b>Какие риски связаны с криптой и сигналами?</b>\n"
+        "Криптовалюта и трейдинг всегда связаны с риском. Нет гарантированного дохода. "
+        "Сигналы и обучение — это инструменты, а решения принимаешь ты."
+    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("💬 Написать в поддержку", callback_data="support"))
+    kb.add(InlineKeyboardButton("⬅️ Назад в профиль", callback_data="home_profile"))
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "support")
+async def cb_support(call: CallbackQuery):
+    text = (
+        "💬 <b>Поддержка</b>\n\n"
+        f"Если возникли вопросы — напиши в поддержку: {SUPPORT_CONTACT}\n\n"
+        "Опиши ситуацию одним сообщением, приложи скрины / хэш транзакции при необходимости."
+    )
+    try:
+        await call.message.edit_text(text)
+    except Exception:
+        await call.message.answer(text)
+    await call.answer()
+
+
+# ---------------------- ОПЛАТА ПОЛНОГО ДОСТУПА -----------------------
+
+
+@dp.callback_query_handler(lambda c: c.data == "open_access")
+async def cb_open_access(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        get_or_create_user(call.message)
+        user_row = get_user_by_tg(call.from_user.id)
+    user_db_id = user_row[0]
+
+    purchase_id = create_purchase(user_db_id, "package", PRICE_PACKAGE)
+    purchase_row = get_purchase(purchase_id)
+    amount = Decimal(str(purchase_row[3]))
+
+    text = (
+        "💳 <b>Открытие полного доступа за $100</b>\n\n"
+        "Ты получаешь:\n"
+        "• обучение по трейдингу (8 модулей)\n"
+        "• обучение по трафику (6 модулей)\n"
+        "• доступ к сигналам на 1 месяц\n"
+        "• доступ к партнёрской программе 50% + 10%\n\n"
+        f"Оплата принимается в USDT (TRC20) на кошелёк:\n"
+        f"<code>{WALLET_ADDRESS}</code>\n\n"
+        f"Сумма к оплате: <b>{amount} USDT</b>\n"
+        "Важно: переводи <b>точно эту сумму</b> с учётом хвостика — по ней бот будет искать платёж.\n\n"
+        "После перевода нажми кнопку «Проверить оплату» ниже.\n"
+        "Если оплата не подтянулась — не переживай, транзакции иногда доходят с задержкой, "
+        "а также всегда есть ручная проверка через поддержку."
+    )
+
+    kb = payment_kb(purchase_id, back_cb="home_profile")
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "renew_signals")
+async def cb_renew_signals(call: CallbackQuery):
+    user_row = get_user_by_tg(call.from_user.id)
+    if not user_row:
+        await call.answer("Сначала запусти бота через /start.", show_alert=True)
+        return
+    user_db_id = user_row[0]
+    full = bool(user_row[7])
+
+    if not full:
+        await call.answer("Продление сигналов доступно только после покупки полного доступа.", show_alert=True)
+        return
+
+    purchase_id = create_purchase(user_db_id, "renewal", PRICE_RENEWAL)
+    purchase_row = get_purchase(purchase_id)
+    amount = Decimal(str(purchase_row[3]))
+
+    text = (
+        "📈 <b>Продление сигналов на 1 месяц</b>\n\n"
+        "Стоимость продления: <b>$50</b>.\n\n"
+        f"Отправь <b>{amount} USDT</b> (TRC20) на кошелёк:\n"
+        f"<code>{WALLET_ADDRESS}</code>\n\n"
+        "После перевода нажми «Проверить оплату». Реферальные начисления с продлений не идут — "
+        "весь платёж идёт на поддержку проекта и развитие экосистемы."
+    )
+
+    kb = payment_kb(purchase_id, back_cb="home_profile")
+
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("check_pay:"))
+async def cb_check_pay(call: CallbackQuery):
+    _, pid_str = call.data.split(":", 1)
+    try:
+        purchase_id = int(pid_str)
+    except ValueError:
+        await call.answer("Некорректный ID покупки.", show_alert=True)
+        return
+
+    purchase_row = get_purchase(purchase_id)
+    if not purchase_row:
+        await call.answer("Покупка не найдена. Напиши в поддержку.", show_alert=True)
+        return
+
+    p_id, user_db_id, product_code, amount_f, status, created_at_str, tx_id = purchase_row
+    amount = Decimal(str(amount_f))
+    created_at = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
+
+    if status == "paid":
+        await call.answer("Эта покупка уже подтверждена ✅", show_alert=True)
+        return
+
+    await call.answer("Ищу оплату в сети Tron, это может занять несколько секунд...")
+
+    tx_hash = await find_payment_for_purchase(amount, created_at)
+    if not tx_hash:
+        await call.message.answer(
+            "❌ Пока не вижу подходящий платёж.\n\n"
+            "Убедись, что отправил <b>точно</b> указанную сумму на правильный адрес и подожди 1–3 минуты.\n"
+            "Если вопрос не решится — напиши в поддержку, указав время и хэш транзакции.",
+            reply_markup=main_reply_kb(),
+        )
+        return
+
+    # фиксируем оплату
+    mark_purchase_paid(purchase_id, tx_hash)
+    await process_successful_payment(get_purchase(purchase_id))
+
+
+# ---------------------------------------------------------------------------
+# АДМИН-КОМАНДЫ (МИНИМАЛЬНЫЙ НАБОР)
+# ---------------------------------------------------------------------------
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+@dp.message_handler(commands=["admin"])
+async def cmd_admin(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    text = (
+        "🔐 <b>Админ-панель</b>\n\n"
+        "Доступные команды:\n"
+        "/grant &lt;id или @username&gt; — выдать полный доступ + сигналы на 1 месяц\n"
+        "/extend_signals &lt;id или @username&gt; — продлить сигналы на 1 месяц\n"
+        "/user &lt;id или @username&gt; — инфо по пользователю"
+    )
+    await message.answer(text)
+    
+@dp.message_handler(commands=["test_signal"])
+async def cmd_test_signal(message: types.Message):
+    # Только админ
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer("⏳ Генерирую тестовый авто-сигнал...")
+
+    text = await build_auto_signal_text(
+        AUTO_SIGNALS_SYMBOLS,
+        True,  # включено принудительно
+    )
+
+    if not text:
+        await message.answer("❌ Не удалось сгенерировать авто-сигнал (нет данных от Binance или ошибка).")
+        return
+
+    try:
+        await bot.send_message(SIGNALS_CHANNEL_ID, text)
+        await message.answer("✅ Тестовый авто-сигнал отправлен в канал.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при отправке в канал.\nПроверь права бота и ID канала.")
+        
+@dp.message_handler(commands=["check_binance"])
+async def cmd_check_binance(message: types.Message):
+    # Только админ
+    if not is_admin(message.from_user.id):
+        return
+
+    await message.answer("⏳ Проверяю Binance...")
+
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    params = {"symbol": "BTCUSDT"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as resp:
+                status = resp.status
+                text = await resp.text()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при запросе к Binance:\n<code>{e}</code>")
+        return
+
+    # Показываем статус и первые символы ответа
+    short = text[:600]
+    await message.answer(
+        f"Статус Binance: <b>{status}</b>\n\n"
+        f"Первые символы ответа:\n<code>{short}</code>"
+    )
+
+    
+
+
+def _find_user_by_any(identifier: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    row = None
+    if identifier.startswith("@"):
+        username = identifier[1:]
+        cur.execute("SELECT id, user_id, username, first_name FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
+    else:
+        try:
+            tg_id = int(identifier)
+            cur.execute("SELECT id, user_id, username, first_name FROM users WHERE user_id = ?", (tg_id,))
+            row = cur.fetchone()
+        except ValueError:
+            row = None
+    conn.close()
+    return row
+
+
+@dp.message_handler(commands=["grant"])
+async def cmd_grant(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/grant @username</code> или <code>/grant 123456789</code>")
+        return
+
+    ident = parts[1].strip()
+    row = _find_user_by_any(ident)
+    if not row:
+        await message.answer("Пользователь не найден в базе.")
+        return
+
+    user_db_id, tg_id, username, first_name = row
+    set_full_access(user_db_id, True)
+    extend_signals(user_db_id, days=30)
+
+    await message.answer(f"✅ Полный доступ выдан пользователю @{username if username else tg_id} + сигналы на 30 дней.")
+    try:
+        await bot.send_message(
+            tg_id,
+            "🎟 <b>Тебе выдан полный доступ вручную администратором.</b>\n\n"
+            "Обучение и партнёрка открыты, сигналы активны на 30 дней.",
+        )
+    except Exception:
+        pass
+
+
+@dp.message_handler(commands=["extend_signals"])
+async def cmd_extend_signals(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/extend_signals @username</code> или <code>/extend_signals 123456789</code>"
+        )
+        return
+
+    ident = parts[1].strip()
+    row = _find_user_by_any(ident)
+    if not row:
+        await message.answer("Пользователь не найден в базе.")
+        return
+
+    user_db_id, tg_id, username, first_name = row
+    extend_signals(user_db_id, days=30)
+    await message.answer(f"✅ Сигналы продлены пользователю @{username if username else tg_id} на 30 дней.")
+    try:
+        await bot.send_message(
+            tg_id,
+            "📈 <b>Твоя подписка на сигналы продлена администратором ещё на 30 дней.</b>",
+        )
+    except Exception:
+        pass
+
+
+@dp.message_handler(commands=["user"])
+async def cmd_user_info(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/user @username</code> или <code>/user 123456789</code>")
+        return
+
+    ident = parts[1].strip()
+    row = _find_user_by_any(ident)
+    if not row:
+        await message.answer("Пользователь не найден в базе.")
+        return
+
+    user_db_id, tg_id, username, first_name = row
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT referrer_id, balance, total_earned, full_access FROM users WHERE id = ?",
+        (user_db_id,),
+    )
+    row2 = cur.fetchone()
+    conn.close()
+    referrer_id, balance, total_earned, full_access = row2
+
+    lvl1, lvl2 = count_referrals(user_db_id)
+    signals_until = get_signals_until(user_db_id)
+
+    text = (
+        f"👤 <b>Пользователь</b>\n\n"
+        f"ID в БД: <code>{user_db_id}</code>\n"
+        f"TG ID: <code>{tg_id}</code>\n"
+        f"Username: @{username if username else '—'}\n"
+        f"Имя: {first_name}\n\n"
+        f"Referrer ID (в БД): {referrer_id}\n"
+        f"Full access: {'да' if full_access else 'нет'}\n"
+        f"Баланс: {balance}\n"
+        f"Всего заработано: {total_earned}\n"
+        f"Рефералы: 1л — {lvl1}, 2л — {lvl2}\n"
+        f"Сигналы активны до: {signals_until.strftime('%Y-%m-%d %H:%M:%S') if signals_until else 'нет'}"
+    )
+
+    await message.answer(text)
+
+
+# ---------------------------------------------------------------------------
+# WATCHER: СЛЕДИМ ЗА ИСТЕЧЕНИЕМ СИГНАЛОВ
+# ---------------------------------------------------------------------------
+
+
+async def signals_watcher():
+    """
+    Периодически проверяем, у кого истёк доступ к сигналам,
+    и при необходимости кикаем из канала (если у бота есть права).
+    """
+    await asyncio.sleep(5)
     while True:
-        for user_id in list(user_unique_price.keys()):
-            if await check_trx_payment(user_id):
-                amount = user_unique_price[user_id]
-                save_payment(user_id, amount, amount)
-                user_unique_price.pop(user_id, None)
-        await asyncio.sleep(PAYMENT_SCAN_INTERVAL)
+        try:
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            conn = db_connect()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT sa.user_id, u.user_id
+                FROM signals_access sa
+                JOIN users u ON sa.user_id = u.id
+                WHERE sa.active_until IS NOT NULL AND sa.active_until < ?
+                """,
+                (now,),
+            )
+            rows = cur.fetchall()
+            conn.close()
+
+            for user_db_id, tg_id in rows:
+                try:
+                    # мягкий кик: ban + unban, чтобы убрать из канала
+                    await bot.ban_chat_member(SIGNALS_CHANNEL_ID, tg_id)
+                    await bot.unban_chat_member(SIGNALS_CHANNEL_ID, tg_id)
+                    logger.info("Removed user %s from signals channel (expired).", tg_id)
+                except Exception as e:
+                    logger.error("Failed to remove user %s from channel: %s", tg_id, e)
+
+        except Exception as e:
+            logger.error("Signals watcher error: %s", e)
+
+        await asyncio.sleep(3600)  # раз в час
 
 
-# ==========================
-# ЗАПУСК БОТА
-# ==========================
+# ---------------------------------------------------------------------------
+# ФОЛЛБЭК
+# ---------------------------------------------------------------------------
 
-async def main():
-    asyncio.create_task(periodic_tasks())
-    await dp.start_polling()
+
+@dp.message_handler()
+async def fallback(message: types.Message):
+    if is_spam(message.from_user.id):
+        return
+    await message.answer(
+        "Не понял сообщение 🤔\nИспользуй кнопки внизу или нажми /start, чтобы вернуться в главное меню.",
+        reply_markup=main_reply_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ЗАПУСК
+# ---------------------------------------------------------------------------
+
+
+async def on_startup(dp: Dispatcher):
+    init_db()
+    asyncio.create_task(signals_watcher())
+    asyncio.create_task(
+        auto_signals_worker(
+            bot,
+            SIGNALS_CHANNEL_ID,
+            AUTO_SIGNALS_PER_DAY,
+            AUTO_SIGNALS_SYMBOLS,
+            AUTO_SIGNALS_ENABLED,
+        )
+    )
+    logger.info("Bot started and DB initialized.")
+
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    init_db()
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
